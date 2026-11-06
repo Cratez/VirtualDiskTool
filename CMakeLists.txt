@@ -80,6 +80,22 @@ if(VDT_BUILD_TOOL)
 		tools/main.cpp
 		tools/VirtualDiskTool.rc)
 	target_link_libraries(VirtualDiskTool PRIVATE VirtualDiskCli)
+
+	# Leaves a zip next to the exe after a Release build, ready to upload. This is a target of its
+	# own because a post-build step only runs on a relink, and wouldn't notice the docs changing.
+	if(VDT_TOP_LEVEL)
+		string(TOLOWER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" vdt_architecture)
+		add_custom_target(PackageTool ALL
+			COMMAND ${CMAKE_COMMAND}
+				-DCONFIG=$<CONFIG>
+				-DEXE=$<TARGET_FILE:VirtualDiskTool>
+				-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+				-DSTAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/package
+				-DPACKAGE_NAME=VirtualDiskTool-${PROJECT_VERSION}-windows-${vdt_architecture}
+				-P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageTool.cmake
+			VERBATIM)
+		add_dependencies(PackageTool VirtualDiskTool)
+	endif()
 endif()
 
 if(VDT_BUILD_TESTS)

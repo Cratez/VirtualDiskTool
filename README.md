@@ -72,6 +72,16 @@ Build presets add `-debug` or `-release` to the name, and output goes to `build/
 
 The first time you generate a preset, vcpkg downloads and builds GoogleTest, which takes about a minute. vcpkg keeps its own tools and a cache in `%LOCALAPPDATA%\vcpkg`, which can reach several hundred MB and is safe to delete. To build without the tests, and so without any dependencies, configure with `-DVDT_BUILD_TESTS=OFF`.
 
+## Releasing
+
+Every Release build also leaves a zip next to the exe, ready to upload:
+
+```
+build/vs2026/Release/VirtualDiskTool-0.1.0-windows-x64.zip
+```
+
+It holds the tool, this README, the docs and the license. The version in its name comes from `project()` in `CMakeLists.txt`, so change it there before building a new release. Only building the whole solution makes the zip, not building the `VirtualDiskTool` project on its own.
+
 ## Testing
 
 Each build puts `VirtualDiskTests.exe` and `Run-Tests.ps1` side by side in `build/<preset>/<config>/`. Running the exe by itself is safe anywhere, and without admin rights it skips the tests that attach real disks.
