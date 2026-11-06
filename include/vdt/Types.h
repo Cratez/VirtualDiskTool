@@ -61,6 +61,9 @@ struct VolumeSpec {
 	PartitionStyle partitionStyle = PartitionStyle::Gpt;
 	std::string label; // UTF-8. May be empty.
 	bool quickFormat = true;
+
+	// Encrypts the volume, straight after formatting it. UTF-8. Empty means no encryption.
+	std::string password;
 };
 
 /// <summary>
@@ -88,6 +91,14 @@ struct AttachOptions {
 	// Where to mount the volume: "Z:\" or an empty folder on Windows, an empty directory
 	// elsewhere. When unset, the backend chooses.
 	std::optional<std::filesystem::path> mountPath;
+
+	// Unlocks an encrypted image. Give one of these at most. UTF-8.
+	std::string password;
+	std::string recoveryKey;
+
+	// Attaches an encrypted image without unlocking it, instead of failing with Errc::Locked.
+	// Its files stay unreadable, but VirtualDisk::Format can still erase it.
+	bool allowLocked = false;
 };
 
 /// <summary>

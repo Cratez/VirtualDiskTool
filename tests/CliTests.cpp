@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -230,6 +231,220 @@ TEST_F(CliTest, FormatNeverReachesTheBackendForADriveLetter) {
 		EXPECT_EQ(Run({ "format", target, "--fs", "ntfs", "--yes" }), cli::kExitFailure) << target;
 		EXPECT_TRUE(backend.calls.empty()) << target;
 	}
+}
+
+// --- encryption ---
+
+TEST(StripByteOrderMarksTest, RemovesThemFromTheStartOnly) {
+	EXPECT_EQ(cli::StripByteOrderMarks("pw"), "pw");
+	EXPECT_EQ(cli::StripByteOrderMarks("\xEF\xBB\xBFpw"), "pw");
+	EXPECT_EQ(cli::StripByteOrderMarks("\xEF\xBB\xBF\xEF\xBB\xBFpw"), "pw");
+	EXPECT_EQ(cli::StripByteOrderMarks("\xEF\xBB\xBF"), "");
+	EXPECT_EQ(cli::StripByteOrderMarks(""), "");
+	EXPECT_EQ(cli::StripByteOrderMarks("p\xEF\xBB\xBFw"), "p\xEF\xBB\xBFw");
+}
+
+namespace {
+
+class CliEncryptionTest : public CliTest {
+protected:
+	int RunWithPassword(std::vector<std::string> args, std::optional<std::string> password = "password") {
+		out.str("");
+		err.str("");
+		return cli::Run(args, out, err, backend, [&](bool confirm) {
+			lastConfirm = confirm;
+			++passwordReads;
+			return password;
+		});
+	}
+
+	std::string KeyFile() const {
+		return Image("disk.key");
+	}
+
+	std::string ReadKeyFile() const {
+		std::ifstream file(KeyFile());
+		std::string key;
+		std::getline(file, key);
+		return key;
+	}
+
+	bool lastConfirm = false;
+	int passwordReads = 0;
+};
+
+} // anonymous namespace
+
+TEST_F(CliEncryptionTest, CreateEncryptsAndSavesTheRecoveryKey) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", KeyFile() }), cli::kExitSuccess) << err.str();
+
+	EXPECT_EQ(backend.lastEncryptionPassword, "password");
+	EXPECT_TRUE(lastConfirm);
+	EXPECT_EQ(ReadKeyFile(), "recovery-key");
+}
+
+TEST_F(CliEncryptionTest, EncryptRequiresARecoveryKeyFile) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt" }), cli::kExitUsage);
+	EXPECT_NE(err.str().find("--recovery-key-file"), std::string::npos);
+	EXPECT_TRUE(backend.calls.empty());
+	EXPECT_EQ(passwordReads, 0);
+}
+
+TEST_F(CliEncryptionTest, ARecoveryKeyFileNeedsEncrypt) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--recovery-key-file", KeyFile() }), cli::kExitUsage);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, EncryptNeedsAFileSystem) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--fs", "none", "--encrypt", "--recovery-key-file", KeyFile() }), cli::kExitUsage);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, APasswordIsNeverAnArgument) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", KeyFile(), "--password", "secret" }), cli::kExitUsage);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, NoPasswordStopsEverythingAndLeavesNoKeyFile) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", KeyFile() }, std::nullopt), cli::kExitUsage);
+	EXPECT_TRUE(backend.calls.empty());
+	EXPECT_FALSE(fs::exists(KeyFile()));
+}
+
+TEST_F(CliEncryptionTest, AnExistingKeyFileIsNeverOverwritten) {
+	std::ofstream(KeyFile()) << "precious";
+
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", KeyFile() }), cli::kExitFailure);
+
+	EXPECT_TRUE(backend.calls.empty());
+	EXPECT_EQ(passwordReads, 0);
+	EXPECT_EQ(ReadKeyFile(), "precious");
+}
+
+TEST_F(CliEncryptionTest, AnUnwritableKeyFileFailsBeforeCreatingAnything) {
+	const std::string path = Image("missing-folder\\disk.key");
+
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", path }), cli::kExitFailure);
+
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, AFailedCreateLeavesNoKeyFile) {
+	backend.failures["Encrypt"] = Error{ Errc::TooSmallToEncrypt, "Encrypt" };
+
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", KeyFile() }), cli::kExitFailure);
+
+	EXPECT_FALSE(fs::exists(KeyFile()));
+	EXPECT_FALSE(fs::exists(Image()));
+}
+
+TEST_F(CliEncryptionTest, AttachOfALockedImageExplainsWhatToDo) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image() }), cli::kExitFailure);
+
+	EXPECT_NE(err.str().find("password"), std::string::npos);
+	EXPECT_EQ(passwordReads, 0);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(CliEncryptionTest, AttachUnlockAsksForThePassword) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--unlock" }), cli::kExitSuccess) << err.str();
+
+	EXPECT_FALSE(lastConfirm);
+	EXPECT_FALSE(backend.diskIsLocked);
+}
+
+TEST_F(CliEncryptionTest, AttachWithAWrongPasswordFails) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--unlock" }, "wrong"), cli::kExitFailure);
+
+	EXPECT_TRUE(out.str().empty());
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(CliEncryptionTest, AttachReadsARecoveryKeyFile) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+	std::ofstream(KeyFile()) << "recovery-key\r\n";
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--recovery-key-file", KeyFile() }), cli::kExitSuccess) << err.str();
+
+	EXPECT_FALSE(backend.diskIsLocked);
+	EXPECT_EQ(passwordReads, 0);
+}
+
+TEST_F(CliEncryptionTest, AttachIgnoresAByteOrderMarkInAKeyFile) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+	std::ofstream(KeyFile()) << "\xEF\xBB\xBF" "recovery-key\r\n";
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--recovery-key-file", KeyFile() }), cli::kExitSuccess) << err.str();
+
+	EXPECT_FALSE(backend.diskIsLocked);
+}
+
+// An empty key would read as no key, so attaching a plain image would quietly succeed.
+TEST_F(CliEncryptionTest, AKeyFileWithNoKeyIsAnError) {
+	WriteImageFile();
+	std::ofstream(KeyFile()) << "\nrecovery-key\n";
+
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--recovery-key-file", KeyFile() }), cli::kExitFailure);
+
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, APasswordGivenAsAnOptionIsNotRepeatedBack) {
+	const std::vector<std::vector<std::string>> attempts = {
+		{ "create", Image(), "--size", "8M", "--password=hunter2" },
+		{ "create", Image(), "--size", "8M", "--password:hunter2" },
+		{ "--password=hunter2", "create", Image(), "--size", "8M" },
+		{ "--password:hunter2", "create", Image(), "--size", "8M" },
+		{ "/password:hunter2", "create", Image(), "--size", "8M" } };
+
+	for (const std::vector<std::string>& attempt : attempts) {
+		EXPECT_EQ(RunWithPassword(attempt), cli::kExitUsage);
+		EXPECT_EQ(err.str().find("hunter2"), std::string::npos) << err.str();
+		EXPECT_NE(err.str().find("password"), std::string::npos) << err.str();
+	}
+}
+
+// The key would vanish, and the disk couldn't be recovered.
+TEST_F(CliEncryptionTest, ADeviceCannotHoldARecoveryKey) {
+	EXPECT_EQ(RunWithPassword({ "create", Image(), "--size", "8M", "--encrypt", "--recovery-key-file", "NUL" }), cli::kExitFailure);
+
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, AttachRefusesBothWaysOfUnlocking) {
+	WriteImageFile();
+	EXPECT_EQ(RunWithPassword({ "attach", Image(), "--unlock", "--recovery-key-file", KeyFile() }), cli::kExitUsage);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(CliEncryptionTest, FormatErasesALockedImageWithoutAPassword) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	EXPECT_EQ(RunWithPassword({ "format", Image(), "--yes" }), cli::kExitSuccess) << err.str();
+
+	EXPECT_EQ(passwordReads, 0);
+	EXPECT_EQ(backend.calls.back(), "Detach");
+}
+
+TEST_F(CliEncryptionTest, FormatCanEncrypt) {
+	WriteImageFile();
+
+	EXPECT_EQ(RunWithPassword({ "format", Image(), "--yes", "--encrypt", "--recovery-key-file", KeyFile() }), cli::kExitSuccess) << err.str();
+
+	EXPECT_EQ(backend.lastEncryptionPassword, "password");
+	EXPECT_EQ(ReadKeyFile(), "recovery-key");
 }
 
 // --- list ---

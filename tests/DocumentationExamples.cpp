@@ -89,6 +89,34 @@ int List() {
 	return 0;
 }
 
+int Encrypted() {
+	auto disk = vdt::VirtualDisk::Create("C:\\Images\\secret.vhdx", {
+		.size = vdt::GiB(1),
+		.volume = { .password = "a long passphrase" } });
+	if (!disk) {
+		std::cerr << disk.GetError().Message() << '\n';
+		return 1;
+	}
+
+	// Save this somewhere other than next to the image.
+	std::ofstream("D:\\Keys\\secret.key") << disk->GetRecoveryKey();
+	return 0;
+}
+
+int OpenEncrypted() {
+	vdt::AttachOptions options;
+	options.password = "a long passphrase";
+
+	auto disk = vdt::VirtualDisk::Open("C:\\Images\\secret.vhdx", options);
+	if (!disk) {
+		if (disk.GetError().code == vdt::Errc::WrongPassword) {
+			std::cerr << "Wrong password.\n";
+		}
+		return 1;
+	}
+	return 0;
+}
+
 int Errors() {
 	auto disk = vdt::VirtualDisk::Open("C:\\Images\\data.vhdx");
 	if (!disk) {

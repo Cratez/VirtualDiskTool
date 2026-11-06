@@ -51,7 +51,8 @@ TEST(ErrorTest, MessageNamesTheStepAndTheReason) {
 
 TEST(ErrorTest, EveryCodeHasItsOwnMessage) {
 	const Errc codes[] = { Errc::InvalidArgument, Errc::Unsupported, Errc::AlreadyExists,
-		Errc::NotAttached, Errc::AlreadyAttached, Errc::NotVirtualDisk, Errc::NoVolume, Errc::Timeout };
+		Errc::NotAttached, Errc::AlreadyAttached, Errc::NotVirtualDisk, Errc::NoVolume, Errc::Timeout,
+		Errc::Locked, Errc::WrongPassword, Errc::TooSmallToEncrypt };
 	for (const Errc code : codes) {
 		EXPECT_NE(make_error_code(code).message(), "unknown error");
 	}

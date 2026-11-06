@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "vdt/Backend.h"
+#include "windows/BitLocker.h"
 #include "windows/DiskLayout.h"
 #include "windows/VolumeFormat.h"
 #include "windows/Win32.h"
@@ -148,10 +149,19 @@ public:
 	}
 
 	Result<bool> IsFileBackedVirtualDisk() override {
+		// The image's own handle knows where its disk is now, and fails once it is detached.
+		// Without this, a disk number that had passed to another image would still say yes.
+		Result<std::wstring> current = GetPhysicalPath(m_handle.Get());
+		if (!current) {
+			return current.GetError();
+		}
+		if (*current != m_physicalPath) {
+			return false;
+		}
 		return win::IsFileBackedVirtualDisk(m_physicalPath);
 	}
 
-	Result<void> Initialize(const VolumeSpec& volume) override {
+	Result<void> Initialize(const VolumeSpec& volume, bool eraseOutsideVolume) override {
 		if (Result<void> unmounted = Unmount(); !unmounted) {
 			return unmounted;
 		}
@@ -164,7 +174,7 @@ public:
 		if (volume.fileSystem == FileSystem::None) {
 			return ClearLayout(m_physicalPath);
 		}
-		if (Result<void> written = WriteSinglePartition(m_physicalPath, volume); !written) {
+		if (Result<void> written = WriteSinglePartition(m_physicalPath, volume, eraseOutsideVolume); !written) {
 			return written;
 		}
 
@@ -173,6 +183,9 @@ public:
 		Result<std::wstring> created = WaitForVolume(m_diskNumber, previous);
 		if (!created) {
 			return created.GetError();
+		}
+		if (Result<void> confirmed = ConfirmStillVirtual(); !confirmed) {
+			return confirmed;
 		}
 		if (Result<void> formatted = FormatVolume(*created, volume); !formatted) {
 			return formatted;
@@ -226,6 +239,38 @@ public:
 		return Win32Error("Find a free drive letter", ERROR_NO_MORE_ITEMS);
 	}
 
+	Result<std::string> Encrypt(const std::string& password, bool wholeVolume) override {
+		Result<std::wstring> volume = WaitForVolume(m_diskNumber);
+		if (!volume) {
+			return volume.GetError();
+		}
+		if (Result<void> confirmed = ConfirmStillVirtual(); !confirmed) {
+			return confirmed.GetError();
+		}
+		return ProtectVolume(*volume, password, wholeVolume);
+	}
+
+	Result<bool> IsLocked() override {
+		const std::optional<std::wstring> volume = FindVolume(m_diskNumber);
+		return volume ? IsVolumeLocked(*volume) : Result<bool>(false);
+	}
+
+	Result<void> UnlockWithPassword(const std::string& password) override {
+		Result<std::wstring> volume = WaitForVolume(m_diskNumber);
+		if (!volume) {
+			return volume.GetError();
+		}
+		return UnlockVolume(*volume, password);
+	}
+
+	Result<void> UnlockWithRecoveryKey(const std::string& recoveryKey) override {
+		Result<std::wstring> volume = WaitForVolume(m_diskNumber);
+		if (!volume) {
+			return volume.GetError();
+		}
+		return UnlockVolumeWithRecoveryKey(*volume, recoveryKey);
+	}
+
 	Result<void> Unmount() override {
 		if (m_mountPoint.empty()) {
 			return {};
@@ -272,6 +317,23 @@ public:
 	}
 
 private:
+	/// <summary>
+	/// FormatEx and BitLocker take a volume's name, so neither can use the handle a safety check
+	/// ran on, and a disk number can be reused while waiting for a volume. So this goes between
+	/// finding a volume and using it. From then on its name pins the target, because a volume's
+	/// GUID belongs to that volume alone.
+	/// </summary>
+	Result<void> ConfirmStillVirtual() {
+		Result<bool> isVirtual = IsFileBackedVirtualDisk();
+		if (!isVirtual) {
+			return Error{ Errc::NotVirtualDisk, "Safety check failed: " + isVirtual.GetError().Message() };
+		}
+		if (!*isVirtual) {
+			return Error{ Errc::NotVirtualDisk, "Safety check" };
+		}
+		return {};
+	}
+
 	Result<fs::path> MountAt(std::wstring target, const std::wstring& volume) {
 		if (!SetVolumeMountPointW(target.c_str(), volume.c_str())) {
 			return LastError("SetVolumeMountPoint");
@@ -322,6 +384,11 @@ public:
 		default:
 			return false;
 		}
+	}
+
+	bool SupportsEncryption() const noexcept override {
+		// Encrypting only the data in use, which keeps dynamic images small, needs Windows 8.
+		return IsWindows8OrGreater();
 	}
 
 	bool CleansUpAfterCrash() const noexcept override {

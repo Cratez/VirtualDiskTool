@@ -51,9 +51,17 @@ public:
 	std::vector<ImageFormat> unsupportedFormats;
 	std::vector<FileSystem> unsupportedFileSystems;
 	bool reportsVirtual = true;
+	int virtualChecksBeforeRefusing = -1; // After this many yes answers, say no. Negative never does.
+	bool supportsEncryption = true;
+	bool diskIsLocked = false;
+	std::string correctPassword = "password";
+	std::string correctRecoveryKey = "recovery-key";
 	int attached = 0; // Attachments currently holding a disk.
 	int leaked = 0;   // Attachments destroyed while still holding one.
 
+	std::optional<std::string> lastEncryptionPassword;
+	bool lastEncryptionWholeVolume = false;
+	bool lastEraseOutsideVolume = false;
 	std::optional<DiskSpec> lastSpec;
 	std::optional<AttachOptions> lastOptions;
 	std::optional<VolumeSpec> lastVolume;
@@ -79,6 +87,7 @@ public:
 		return std::find(unsupportedFileSystems.begin(), unsupportedFileSystems.end(), fileSystem) == unsupportedFileSystems.end();
 	}
 
+	bool SupportsEncryption() const noexcept override { return supportsEncryption; }
 	bool CleansUpAfterCrash() const noexcept override { return true; }
 
 	Result<void> CreateImage(const std::filesystem::path& image, const DiskSpec& spec) override {
@@ -121,11 +130,18 @@ public:
 		if (Result<void> step = m_backend.Step("IsFileBackedVirtualDisk"); !step) {
 			return step.GetError();
 		}
+		if (m_backend.virtualChecksBeforeRefusing == 0) {
+			return false;
+		}
+		if (m_backend.virtualChecksBeforeRefusing > 0) {
+			--m_backend.virtualChecksBeforeRefusing;
+		}
 		return m_backend.reportsVirtual;
 	}
 
-	Result<void> Initialize(const VolumeSpec& volume) override {
+	Result<void> Initialize(const VolumeSpec& volume, bool eraseOutsideVolume) override {
 		m_backend.lastVolume = volume;
+		m_backend.lastEraseOutsideVolume = eraseOutsideVolume;
 		return m_backend.Step("Initialize");
 	}
 
@@ -138,6 +154,36 @@ public:
 
 	Result<void> Unmount() override {
 		return m_backend.Step("Unmount");
+	}
+
+	Result<std::string> Encrypt(const std::string& password, bool wholeVolume) override {
+		m_backend.lastEncryptionPassword = password;
+		m_backend.lastEncryptionWholeVolume = wholeVolume;
+		if (Result<void> step = m_backend.Step("Encrypt"); !step) {
+			return step.GetError();
+		}
+		return m_backend.correctRecoveryKey;
+	}
+
+	Result<bool> IsLocked() override {
+		if (Result<void> step = m_backend.Step("IsLocked"); !step) {
+			return step.GetError();
+		}
+		return m_backend.diskIsLocked;
+	}
+
+	Result<void> UnlockWithPassword(const std::string& password) override {
+		if (Result<void> step = m_backend.Step("UnlockWithPassword"); !step) {
+			return step;
+		}
+		return Unlock(password == m_backend.correctPassword);
+	}
+
+	Result<void> UnlockWithRecoveryKey(const std::string& recoveryKey) override {
+		if (Result<void> step = m_backend.Step("UnlockWithRecoveryKey"); !step) {
+			return step;
+		}
+		return Unlock(recoveryKey == m_backend.correctRecoveryKey);
 	}
 
 	Result<void> Detach() override {
@@ -154,6 +200,14 @@ public:
 	}
 
 private:
+	Result<void> Unlock(bool accepted) {
+		if (!accepted) {
+			return Error{ Errc::WrongPassword, "Unlock" };
+		}
+		m_backend.diskIsLocked = false;
+		return {};
+	}
+
 	void Stop() noexcept {
 		if (m_holding) {
 			m_holding = false;

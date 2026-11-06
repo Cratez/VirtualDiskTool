@@ -133,6 +133,7 @@ The file extension has to match the format, so `.vhd` for `Vhd` and `.vhdx` for 
 | `partitionStyle` | `Gpt` or `Mbr`. | `Gpt` |
 | `label` | Volume label, in UTF-8. | Empty |
 | `quickFormat` | `false` for a full format. | `true` |
+| `password` | Encrypts the volume. See [Encryption](#encryption). | Empty, so not encrypted |
 
 ReFS is untested, and the other `FileSystem` values are for other platforms. Anything the platform can't do fails with `Errc::Unsupported`, and it never falls back to something else.
 
@@ -143,12 +144,17 @@ ReFS is untested, and the other `FileSystem` values are for other platforms. Any
 | `lifetime` | `Scoped` or `Persistent`. See [Lifetimes](#lifetimes). | `Scoped` |
 | `readOnly` | Attach read-only. A read-only disk can't be formatted. | `false` |
 | `mountPath` | A drive letter such as `Z:\`, or an empty folder on an NTFS volume. | The highest free drive letter |
+| `password` | Unlocks an encrypted image. `Create` and `CreateTemporary` refuse it, because a new disk's password goes in `VolumeSpec`. | Empty |
+| `recoveryKey` | Unlocks an encrypted image instead of `password`. `Create` and `CreateTemporary` refuse it too. | Empty |
+| `allowLocked` | Attach an encrypted image without unlocking it. | `false` |
 
 ## Using a disk
 
 ```cpp
 disk->GetMountPath();   // Where the volume is. Empty if nothing is mounted.
 disk->GetImagePath();   // The image file.
+disk->GetRecoveryKey(); // The recovery key, if this object encrypted the disk.
+disk->IsLocked();       // True for an encrypted disk attached with allowLocked.
 disk->Format(volume);   // Erases the disk and writes a new volume.
 disk->Detach();         // Detaches now, and reports any failure.
 disk->Release();        // Persistent only: stop managing it, and leave it attached.
@@ -188,6 +194,63 @@ auto detached = vdt::DetachImage("C:\\Images\\data.vhdx");
 ```
 
 A destructor can't report failure. If you need to know that a detach worked, call `Detach()` yourself.
+
+## Encryption
+
+Setting `VolumeSpec::password` protects a volume with BitLocker, so a copy of the image file is unreadable without the password or recovery key. It works with `Create`, `CreateTemporary` and `Format`:
+
+```cpp
+auto disk = vdt::VirtualDisk::Create("C:\\Images\\secret.vhdx", {
+	.size = vdt::GiB(1),
+	.volume = { .password = "a long passphrase" } });
+if (!disk) {
+	std::cerr << disk.GetError().Message() << '\n';
+	return 1;
+}
+
+// Save this somewhere other than next to the image.
+std::ofstream("D:\\Keys\\secret.key") << disk->GetRecoveryKey();
+```
+
+Detaching locks the disk again. To open it, give `AttachOptions::password` or `AttachOptions::recoveryKey`:
+
+```cpp
+vdt::AttachOptions options;
+options.password = "a long passphrase";
+
+auto disk = vdt::VirtualDisk::Open("C:\\Images\\secret.vhdx", options);
+if (!disk) {
+	if (disk.GetError().code == vdt::Errc::WrongPassword) {
+		std::cerr << "Wrong password.\n";
+	}
+	return 1;
+}
+```
+
+Without either, `Open` fails with `Errc::Locked` and leaves the image detached. Giving either for an image that isn't encrypted fails with `Errc::InvalidArgument`, so that code can't wrongly believe a disk is protected.
+
+`AttachOptions::allowLocked` attaches a locked image anyway. Its files stay unreadable, but `Format` can erase it, without the password. If the library can't tell whether an image is locked, `Open` fails with the reason. The exception is `allowLocked` with no password or key, which treats the image as locked.
+
+**Save the recovery key.** `GetRecoveryKey()` is the only chance to get it through this library, and if the password and key are both lost, the data is gone for good. The command line tool requires a key file for this reason, but the library can't force you to keep it. Treat the key like the password, because anyone who has it can unlock the image.
+
+### What it doesn't do
+
+- **It only protects data at rest.** While a disk is attached and unlocked, anything on that machine with access to the volume can read it.
+- **It doesn't stop anyone destroying data.** `Format` needs no password, and anyone with access to the file can delete it.
+- **It can't be added to a disk that keeps its data.** Encrypting happens as part of creating or formatting, which start with an empty volume.
+- **It can't change or remove a password.** To do either, copy the data off and `Format`.
+- **It can't fully protect passwords in memory.** Passwords pass through ordinary `std::string` values. The library clears the copies it keeps, but not yours, and memory isn't locked against being paged out.
+
+### Limits
+
+- **Windows edition:** BitLocker needs Windows Pro, Enterprise or Education. Home editions can't create encrypted images.
+- **Disk size:** a 64 MiB disk fails with `Errc::TooSmallToEncrypt`, and a 256 MiB disk works. The exact minimum isn't known yet.
+- **File systems:** Microsoft documents this as NTFS only. exFAT worked in testing on Windows 10, but treat it as unofficial.
+- **Passwords:** BitLocker can reject a short or simple password, and Group Policy can forbid passwords altogether.
+- **Image size:** encrypting costs a roughly fixed amount of space in a new dynamic VHDX, rather than a share of its size. An encrypted VHDX used 196 MiB for a 256 MiB disk, 292 to 356 MiB for 1 GiB and 388 to 420 MiB for 8 GiB, varying between runs. A VHD uses less, at 52 MiB for a 256 MiB disk. `Format` encrypts the whole volume, and erases the rest of the disk, because old data could still be there. So it takes longer, and a dynamic image grows to about its full size.
+- **Very large disks:** `Format` gives up after 12 hours with `Errc::Timeout`, which leaves the disk partly encrypted with no recovery key. Format it again to start over.
+- **Older Windows:** images use Windows' default algorithm, XTS-AES 128, which Windows older than 10 version 1511 can't be expected to unlock.
+- **Windows Sandbox:** encryption is untested there, and isn't expected to work, because Sandbox denied access to the WMI interfaces the tests tried, and BitLocker is managed through WMI. Unencrypted disks work there, apart from the full NTFS format issue below.
 
 ## Finding attached disks
 
@@ -240,6 +303,9 @@ Check a `Result` before reading it: reading the value of a failed one, or the er
 | `NotVirtualDisk` | Refused: Windows didn't confirm that the target is a file-backed virtual disk. |
 | `NoVolume` | The disk has no volume to mount. |
 | `Timeout` | Windows didn't bring the disk or volume online in time. |
+| `Locked` | The disk is encrypted, and no password or recovery key was given. |
+| `WrongPassword` | The password or recovery key didn't unlock the disk. |
+| `TooSmallToEncrypt` | The volume is too small for Windows to encrypt. |
 
 ## Safety
 
@@ -259,3 +325,4 @@ The same interface is how support for another platform would be added. See [DESI
 - Windows 10 is the only supported version. See [Supported platforms](../README.md#supported-platforms).
 - A full NTFS format failed in Windows Sandbox on Windows 11. Quick formats work there.
 - ReFS is untested.
+- Encryption has [its own limits](#encryption).

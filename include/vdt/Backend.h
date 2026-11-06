@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "vdt/Result.h"
@@ -28,9 +29,10 @@ public:
 
 	/// <summary>
 	/// Destroys the disk's contents and writes one partition and file system.
-	/// The only destructive call in a backend.
+	/// The only destructive call in a backend. eraseOutsideVolume also zeroes every part of the
+	/// disk the new volume won't cover, because encrypting the volume can't reach those.
 	/// </summary>
-	virtual Result<void> Initialize(const VolumeSpec& volume) = 0;
+	virtual Result<void> Initialize(const VolumeSpec& volume, bool eraseOutsideVolume) = 0;
 
 	/// <summary>
 	/// Mounts the disk's volume and returns where it can be reached with ordinary file APIs.
@@ -42,6 +44,25 @@ public:
 	/// Removes the mount made by Mount. Succeeds if nothing is mounted.
 	/// </summary>
 	virtual Result<void> Unmount() = 0;
+
+	/// <summary>
+	/// Encrypts the volume Initialize just wrote, and returns a new recovery key for it.
+	/// VirtualDisk calls IsFileBackedVirtualDisk immediately before this. wholeVolume means
+	/// free space may hold old data, so it has to be encrypted too. Otherwise only data in
+	/// use is, which is much faster and keeps a dynamic image small.
+	/// </summary>
+	virtual Result<std::string> Encrypt(const std::string& password, bool wholeVolume) = 0;
+
+	/// <summary>
+	/// True if the volume is encrypted and locked.
+	/// </summary>
+	virtual Result<bool> IsLocked() = 0;
+
+	/// <summary>
+	/// Unlocks the volume. Fails with Errc::WrongPassword if the OS rejects the secret.
+	/// </summary>
+	virtual Result<void> UnlockWithPassword(const std::string& password) = 0;
+	virtual Result<void> UnlockWithRecoveryKey(const std::string& recoveryKey) = 0;
 
 	/// <summary>
 	/// Unmounts and ends the attachment. On failure the disk stays attached and this can be
@@ -71,6 +92,12 @@ public:
 
 	virtual bool Supports(ImageFormat format) const noexcept = 0;
 	virtual bool Supports(FileSystem fileSystem) const noexcept = 0;
+
+	/// <summary>
+	/// True if this OS has an encryption mechanism at all. Encrypting can still fail with
+	/// Errc::Unsupported, because that can depend on the OS edition.
+	/// </summary>
+	virtual bool SupportsEncryption() const noexcept = 0;
 
 	/// <summary>
 	/// True if the OS ends a Scoped attachment by itself when the process dies.

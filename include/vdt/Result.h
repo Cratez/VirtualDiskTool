@@ -23,7 +23,10 @@ enum class Errc {
 	AlreadyAttached,     // Refused: the image is attached already.
 	NotVirtualDisk,      // Refused: the target is not a file-backed virtual disk.
 	NoVolume,            // The disk has no volume to mount.
-	Timeout              // The OS did not bring the disk or volume online in time.
+	Timeout,             // The OS did not bring the disk or volume online in time.
+	Locked,              // The disk is encrypted, and no password or recovery key was given.
+	WrongPassword,       // The password or recovery key did not unlock the disk.
+	TooSmallToEncrypt    // The volume is too small for the OS to encrypt.
 };
 
 const std::error_category& ErrorCategory() noexcept;

@@ -47,6 +47,8 @@ Creates an image holding one formatted volume. By default it attaches the image 
 | `--full-format` | Do a full format instead of a quick one. | Quick |
 | `--attach` | Leave the disk attached, and print where it is mounted. | Detach |
 | `--mount <path>` | With `--attach`: mount here. See [Mounting](#mounting). | Next free drive letter |
+| `--encrypt` | Protect the volume with a password. See [Encryption](#encryption). | Not encrypted |
+| `--recovery-key-file <path>` | With `--encrypt`, and required: save the recovery key here. | |
 
 The image path must end in `.vhd` or `.vhdx`. Without `--attach` the command prints the image path.
 
@@ -55,12 +57,14 @@ The image path must end in `.vhd` or `.vhdx`. Without `--attach` the command pri
 ### attach
 
 ```
-VirtualDiskTool attach <image> [--read-only] [--mount <path>]
+VirtualDiskTool attach <image> [--read-only] [--mount <path>] [--unlock | --recovery-key-file <path>]
 ```
 
 Attaches an image and prints where its volume is mounted. The disk stays attached after the tool exits, until you run `detach`.
 
 A blank image has nothing to mount, so `attach` prints an empty line. Combining that with `--mount` is an error.
+
+An encrypted image needs `--unlock`, which asks for the password, or `--recovery-key-file`, which reads a saved key. Without either, `attach` fails and leaves the image detached. Using either on an image that isn't encrypted is also an error.
 
 ### detach
 
@@ -73,12 +77,12 @@ Unmounts and detaches an image. It fails if the image isn't attached.
 ### format
 
 ```
-VirtualDiskTool format <image> --yes [--fs <name>] [--partition <style>] [--label <text>] [--full-format]
+VirtualDiskTool format <image> --yes [--fs <name>] [--partition <style>] [--label <text>] [--full-format] [--encrypt --recovery-key-file <path>]
 ```
 
 Erases a detached image and writes one new volume, leaving the image detached. `--yes` confirms the erase, and the options mean the same as for `create`.
 
-It refuses an image that is attached, so detach it first.
+It refuses an image that is attached, so detach it first. It works on an encrypted image without its password, and the result isn't encrypted unless you pass `--encrypt` again.
 
 ### list
 
@@ -123,6 +127,54 @@ Names aren't case sensitive. An unknown name is an error, and the tool never fal
 
 `--mount` takes a drive letter such as `Z:\`, or an empty folder on an NTFS volume. Without it, the tool uses the highest free drive letter, working down from `Z:`.
 
+## Encryption
+
+`--encrypt` protects a volume with a password, using BitLocker. A copy of the image file is unreadable without the password or recovery key.
+
+```powershell
+VirtualDiskTool create secret.vhdx --size 1G --encrypt --recovery-key-file D:\Keys\secret.key
+VirtualDiskTool attach secret.vhdx --unlock
+VirtualDiskTool detach secret.vhdx
+```
+
+The tool asks for the password without showing it, and asks twice when setting a new one. Detaching locks the disk again.
+
+Passwords are never command line arguments, because those end up in shell history and process lists. A script can pipe one in instead, as a single line on standard input:
+
+```powershell
+$password | VirtualDiskTool attach secret.vhdx --unlock
+```
+
+If a password has non-ASCII characters, check that your shell sends it as UTF-8. In Windows PowerShell, set `$OutputEncoding = New-Object System.Text.UTF8Encoding($false)` first. Windows PowerShell can also add byte order marks to what it pipes, which the tool ignores.
+
+### The recovery key
+
+`--recovery-key-file` is required, because a forgotten password with no recovery key means the data is gone for good. The tool won't overwrite an existing file. To use the key:
+
+```powershell
+VirtualDiskTool attach secret.vhdx --recovery-key-file D:\Keys\secret.key
+```
+
+Treat the key file like the password, because anyone who has it can unlock the image. Don't keep it next to the image. The tool doesn't restrict who can read it.
+
+### What it doesn't do
+
+- **It only protects data at rest.** While a disk is attached and unlocked, anything on that machine with access to the volume can read it. Detach it when you're done.
+- **It doesn't stop anyone destroying data.** `format --yes` needs no password, and anyone with access to the file can delete it.
+- **It can't be added to a disk that already holds data.** Encrypting happens as part of `create` or `format`, which start with an empty volume.
+- **It can't change or remove a password.** To do either, copy the data off and `format` the image.
+
+### Limits
+
+- **Windows edition:** BitLocker needs Windows Pro, Enterprise or Education. Home editions can't create encrypted images.
+- **Disk size:** a 64 MiB disk is too small and a 256 MiB disk works. The exact minimum isn't known yet.
+- **File systems:** Microsoft documents this as NTFS only. exFAT worked in testing on Windows 10, but treat it as unofficial.
+- **Passwords:** BitLocker can reject a short or simple password, and Group Policy can forbid passwords altogether.
+- **Image size:** encrypting costs a roughly fixed amount of space in a new dynamic VHDX, rather than a share of its size. An encrypted VHDX used 196 MiB for a 256 MiB disk, 292 to 356 MiB for 1 GiB and 388 to 420 MiB for 8 GiB, varying between runs. A VHD uses less, at 52 MiB for a 256 MiB disk. Using `format` to encrypt an existing image encrypts the whole volume, and erases the rest of the disk, because old data could still be there. So it takes longer, and a dynamic image grows to about its full size.
+- **Very large disks:** `format --encrypt` gives up after 12 hours, which leaves the image partly encrypted with no key saved. Format it again to start over.
+- **Older Windows:** images use Windows' default algorithm, XTS-AES 128, which Windows older than 10 version 1511 can't be expected to unlock.
+- **Windows Sandbox:** encryption is untested there, and isn't expected to work, because Sandbox denied access to the WMI interfaces the tests tried, and BitLocker is managed through WMI.
+
 ## Scripts
 
 The tool is built to be scripted:
@@ -163,7 +215,7 @@ Output is always UTF-8. If non-ASCII paths come out garbled in a script, set `[C
 - Commands take image paths, never drive letters or device names, so a typo can't reach a real drive.
 - Before writing to a disk, the tool has Windows confirm that it is a file-backed virtual disk.
 - `format` needs `--yes`, and refuses an image that is attached.
-- `create` never overwrites a file.
+- `create` never overwrites a file, and that includes recovery key files.
 
 ## Known limits
 
@@ -171,3 +223,4 @@ Output is always UTF-8. If non-ASCII paths come out garbled in a script, set `[C
 - Windows 10 is the only supported version. See [Supported platforms](../README.md#supported-platforms).
 - A full NTFS format (`--full-format`) failed in Windows Sandbox on Windows 11. Quick formats work there.
 - ReFS is untested.
+- Encryption has [its own limits](#encryption).

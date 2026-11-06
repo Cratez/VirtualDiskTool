@@ -2,6 +2,10 @@
 
 **Status:** the library, Windows backend, command line tool and test suite are written. The test suite passes on Windows 10 22H2 (build 19045) in a Hyper-V VM. That run used the `vs2026` build, and the `vs2022` build last passed before the command line tool's real-disk tests were added.
 
+Encryption's integration tests pass on Windows 10. Their first run had 10 failures: 8 because MI rejects an empty parameter set, and 2 because `FormatEx` found a new volume in use. What holds the volume is still unknown, so that fix is a bounded retry rather than a cure, and it's unknown whether a later run needed it.
+
+Reformatting with a password has been shown to leave no old data in any of the four kinds of image, including at the start and end of the disk. On the Windows 10 VM a plain quick reformat kept old data in a dynamic VHD, but cleared it from a dynamic VHDX, a fixed VHDX and a fixed VHD. The likely cause is TRIM, which may depend on the storage under the image, but that isn't confirmed, so nothing relies on it. On a dynamic VHD, encrypting only data in use left old data readable, which is why `Format` encrypts the whole volume.
+
 ReFS has never been tested. `FormatEx` reports it as unavailable on Windows 10 Pro, and it failed in Windows Sandbox, so its test has only ever been skipped. Testing it needs a Windows edition that can create it.
 
 In Windows Sandbox on Windows 11 (build 26100), a full (not quick) NTFS format fails at every size tested, before any progress is reported. The same binary passes on Windows 10, so the code isn't obviously at fault, but it isn't known yet whether the cause is Sandbox or Windows 11 itself.
@@ -71,6 +75,15 @@ Other projects link the `vdt::VirtualDisk` target, as [docs/library.md](docs/lib
 - Creating is all or nothing. If any step fails, no image is left behind.
 - Unknown or unavailable options fail with `Errc::Unsupported`. Nothing falls back to a different file system or format.
 
+**Encryption**
+
+- The portable layer only knows about passwords and recovery keys. On Windows the backend uses BitLocker, and other platforms could use LUKS or encrypted disk images behind the same interface. One change would be needed first: `Open` mounts before it unlocks, which suits Windows, but a locked LUKS volume can't be mounted, so a LUKS backend needs `Open` to unlock first. That stays inside `VirtualDisk.cpp` and the Windows backend, so it can wait until such a backend exists.
+- Encrypting goes through the same virtual disk check as formatting, immediately beforehand. `FormatEx` and BitLocker take a volume name rather than a handle, so the Windows backend also repeats the check once it has found the volume. From then on the volume's GUID pins the target. The check also asks the image's own handle where its disk is, so it can't pass on a disk number that has since gone to another image.
+- A new image only needs its data in use encrypted, because it has never held anything else. `Format` encrypts the whole volume, because a quick format can leave old sectors in place, and data-only encryption would leave them readable in the image file. It also zeroes the start and end of the disk before writing the new layout, because a partition doesn't cover those and an earlier layout may have. That refuses to run unless the old layout is confirmed gone.
+- If encrypting fails, the volume is unmounted rather than left usable in the clear, and creating leaves no image behind. Encryption that stops, rather than fails, counts as failing: waiting for it would leave the volume mounted until the timeout.
+- Opening a locked image without a secret fails, rather than giving a mounted but unreadable volume. If BitLocker can't answer, opening an unreadable volume fails too, unless it was opened to be erased. There are two exceptions. On a system with no BitLocker at all, an encrypted image looks unformatted. And BitLocker doesn't list unformatted volumes, so a volume that reports being unformatted and isn't listed counts as not locked, after waiting 10 seconds to be sure it isn't just slow to appear. Erasing needs no password, because anyone who can reach the file can delete it anyway.
+- The Windows client uses the MI API, loaded at run time, rather than COM. COM's route to the encrypted connection BitLocker's WMI namespace requires is process-wide security, which a library shouldn't set. Lock detection tries a plain volume query first, so unencrypted disks never depend on WMI.
+
 **Scope limit:** a disk holds exactly one volume. Multiple partitions can be added later if a real need appears.
 
 ## Platforms
@@ -85,6 +98,7 @@ Only the Windows column is planned for now. The others record how the contract i
 | Partition | Disk IOCTLs | `sfdisk` | `diskutil` |
 | Format | `fmifs.dll` `FormatEx` | `mkfs.*` | `newfs_*` |
 | Virtual disk check | `BusTypeFileBackedVirtual` | Device is a loop device | `hdiutil info` |
+| Encryption | BitLocker | LUKS | Encrypted disk image |
 
 ## Windows versions
 

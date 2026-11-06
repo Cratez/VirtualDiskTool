@@ -18,6 +18,9 @@ public:
 		case Errc::NotVirtualDisk:  return "refused: the target is not a file-backed virtual disk";
 		case Errc::NoVolume:        return "the disk has no volume";
 		case Errc::Timeout:         return "timed out waiting for the operating system";
+		case Errc::Locked:          return "the disk is encrypted, so a password or recovery key is needed";
+		case Errc::WrongPassword:   return "the password or recovery key was not accepted";
+		case Errc::TooSmallToEncrypt: return "the disk is too small to encrypt";
 		}
 		return "unknown error";
 	}

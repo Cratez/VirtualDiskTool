@@ -58,6 +58,14 @@ Result<ImageFormat> ResolveFormat(const fs::path& image, ImageFormat requested, 
 }
 
 Result<void> ValidateVolume(const VolumeSpec& volume, const AttachOptions& options, const IBackend& backend) {
+	if (!volume.password.empty()) {
+		if (volume.fileSystem == FileSystem::None) {
+			return Error{ Errc::InvalidArgument, "A disk with no file system cannot be encrypted" };
+		}
+		if (!backend.SupportsEncryption()) {
+			return Error{ Errc::Unsupported, "Encryption" };
+		}
+	}
 	if (volume.fileSystem == FileSystem::None) {
 		return {};
 	}
@@ -73,7 +81,7 @@ Result<void> ValidateVolume(const VolumeSpec& volume, const AttachOptions& optio
 /// <summary>
 /// The only route to a destructive backend call. Anything but a clear yes from the OS stops here.
 /// </summary>
-Result<void> InitializeIfVirtual(IAttachment& attachment, const VolumeSpec& volume) {
+Result<void> InitializeIfVirtual(IAttachment& attachment, const VolumeSpec& volume, bool eraseOutsideVolume) {
 	Result<bool> isVirtual = attachment.IsFileBackedVirtualDisk();
 	if (!isVirtual) {
 		return Error{ Errc::NotVirtualDisk, "Safety check failed: " + isVirtual.GetError().Message() };
@@ -81,7 +89,72 @@ Result<void> InitializeIfVirtual(IAttachment& attachment, const VolumeSpec& volu
 	if (!*isVirtual) {
 		return Error{ Errc::NotVirtualDisk, "Safety check" };
 	}
-	return attachment.Initialize(volume);
+	return attachment.Initialize(volume, eraseOutsideVolume);
+}
+
+/// <summary>
+/// Writes a volume and mounts it, then encrypts it if asked to. A new image has never held
+/// data, so encrypting what is in use is enough. Reformatting doesn't erase old sectors, so
+/// pass hasOldData to have the whole disk covered, or they stay readable in the image file.
+/// </summary>
+Result<void> WriteVolume(
+	IAttachment& attachment,
+	const VolumeSpec& volume,
+	const std::optional<fs::path>& mountAt,
+	bool hasOldData,
+	fs::path& mountPath,
+	std::string& recoveryKey) {
+
+	if (Result<void> initialized = InitializeIfVirtual(attachment, volume, hasOldData && !volume.password.empty()); !initialized) {
+		return initialized;
+	}
+
+	Result<fs::path> mounted = attachment.Mount(mountAt);
+	if (!mounted) {
+		return mounted.GetError();
+	}
+	mountPath = *mounted;
+	if (volume.password.empty()) {
+		return {};
+	}
+
+	Result<bool> isVirtual = attachment.IsFileBackedVirtualDisk();
+	Result<std::string> key = isVirtual && *isVirtual
+		? attachment.Encrypt(volume.password, hasOldData)
+		: Result<std::string>(Error{ Errc::NotVirtualDisk, "Safety check" });
+	if (!key) {
+		// Never leave an unencrypted volume mounted for a caller who asked for encryption.
+		(void)attachment.Unmount();
+		mountPath.clear();
+		return key.GetError();
+	}
+	recoveryKey = *key;
+	return {};
+}
+
+Result<void> UnlockIfNeeded(IAttachment& attachment, bool locked, const AttachOptions& options) {
+	const bool hasSecret = !options.password.empty() || !options.recoveryKey.empty();
+	if (!locked) {
+		if (hasSecret) {
+			return Error{ Errc::InvalidArgument, "The image is not encrypted" };
+		}
+		return {};
+	}
+	if (!options.password.empty()) {
+		return attachment.UnlockWithPassword(options.password);
+	}
+	if (!options.recoveryKey.empty()) {
+		return attachment.UnlockWithRecoveryKey(options.recoveryKey);
+	}
+	if (options.allowLocked) {
+		return {};
+	}
+	return Error{ Errc::Locked, "Open image" };
+}
+
+void Wipe(std::string& secret) noexcept {
+	std::fill(secret.begin(), secret.end(), '\0');
+	secret.clear();
 }
 
 /// <summary>
@@ -148,13 +221,19 @@ VirtualDisk::VirtualDisk(
 	fs::path image,
 	fs::path mountPath,
 	const AttachOptions& options,
-	bool deleteImage)
+	bool deleteImage,
+	std::string recoveryKey,
+	bool locked)
 	: m_backend(&backend)
 	, m_attachment(std::move(attachment))
 	, m_imagePath(std::move(image))
 	, m_mountPath(std::move(mountPath))
 	, m_options(options)
-	, m_deleteImage(deleteImage) {
+	, m_recoveryKey(std::move(recoveryKey))
+	, m_deleteImage(deleteImage)
+	, m_locked(locked) {
+	Wipe(m_options.password);
+	Wipe(m_options.recoveryKey);
 }
 
 Result<VirtualDisk> VirtualDisk::CreateAt(
@@ -164,6 +243,11 @@ Result<VirtualDisk> VirtualDisk::CreateAt(
 	IBackend& backend,
 	bool deleteImage) {
 
+	// These only unlock existing images. Ignoring them here would make a caller who meant to
+	// set a password believe a plain disk is protected.
+	if (!options.password.empty() || !options.recoveryKey.empty()) {
+		return Error{ Errc::InvalidArgument, "A new disk's password goes in its VolumeSpec" };
+	}
 	if (Result<void> valid = ValidateVolume(spec.volume, options, backend); !valid) {
 		return valid.GetError();
 	}
@@ -182,26 +266,18 @@ Result<VirtualDisk> VirtualDisk::CreateAt(
 	}
 
 	fs::path mountPath;
+	std::string recoveryKey;
 	if (spec.volume.fileSystem != FileSystem::None) {
-		Result<void> initialized = InitializeIfVirtual(**attachment, spec.volume);
-		if (initialized) {
-			Result<fs::path> mounted = (*attachment)->Mount(options.mountPath);
-			if (mounted) {
-				mountPath = *mounted;
-			}
-			else {
-				initialized = mounted.GetError();
-			}
-		}
-		if (!initialized) {
+		Result<void> written = WriteVolume(**attachment, spec.volume, options.mountPath, false, mountPath, recoveryKey);
+		if (!written) {
 			(void)(*attachment)->Detach();
 			attachment->reset();
 			RemoveImage(image, false);
-			return initialized.GetError();
+			return written.GetError();
 		}
 	}
 
-	return VirtualDisk(backend, std::move(*attachment), image, std::move(mountPath), options, deleteImage);
+	return VirtualDisk(backend, std::move(*attachment), image, std::move(mountPath), options, deleteImage, std::move(recoveryKey), false);
 }
 
 Result<VirtualDisk> VirtualDisk::CreateTemporary(const DiskSpec& spec, const AttachOptions& options, IBackend& backend) {
@@ -233,6 +309,9 @@ Result<VirtualDisk> VirtualDisk::Open(const fs::path& image, const AttachOptions
 	if (!fs::is_regular_file(image, error)) {
 		return Error{ error ? error : std::make_error_code(std::errc::no_such_file_or_directory), "Open image" };
 	}
+	if (!options.password.empty() && !options.recoveryKey.empty()) {
+		return Error{ Errc::InvalidArgument, "Give a password or a recovery key, not both" };
+	}
 
 	// Checked here rather than left to the OS, because whether Windows refuses a second attach
 	// can depend on whether the disk has been written to.
@@ -263,11 +342,26 @@ Result<VirtualDisk> VirtualDisk::Open(const fs::path& image, const AttachOptions
 		return mounted.GetError();
 	}
 
-	return VirtualDisk(backend, std::move(*attachment), image, std::move(mountPath), options, false);
+	// A blank disk has no volume, so nothing there can be locked.
+	Result<bool> locked = mountPath.empty() ? Result<bool>(false) : (*attachment)->IsLocked();
+	const bool hasSecret = !options.password.empty() || !options.recoveryKey.empty();
+	if (!locked && options.allowLocked && !hasSecret) {
+		// Someone who is only going to erase it doesn't need the answer, so assume the worst.
+		locked = true;
+	}
+	Result<void> unlocked = locked ? UnlockIfNeeded(**attachment, *locked, options) : Result<void>(locked.GetError());
+	if (!unlocked) {
+		(void)(*attachment)->Detach();
+		return unlocked.GetError();
+	}
+
+	const bool stillLocked = *locked && !hasSecret;
+	return VirtualDisk(backend, std::move(*attachment), image, std::move(mountPath), options, false, std::string(), stillLocked);
 }
 
 VirtualDisk::~VirtualDisk() {
 	Close();
+	Wipe(m_recoveryKey);
 }
 
 VirtualDisk::VirtualDisk(VirtualDisk&& other) noexcept
@@ -276,8 +370,11 @@ VirtualDisk::VirtualDisk(VirtualDisk&& other) noexcept
 	, m_imagePath(std::move(other.m_imagePath))
 	, m_mountPath(std::move(other.m_mountPath))
 	, m_options(std::move(other.m_options))
-	, m_deleteImage(std::exchange(other.m_deleteImage, false)) {
+	, m_recoveryKey(std::move(other.m_recoveryKey))
+	, m_deleteImage(std::exchange(other.m_deleteImage, false))
+	, m_locked(std::exchange(other.m_locked, false)) {
 	other.m_mountPath.clear();
+	Wipe(other.m_recoveryKey);
 }
 
 VirtualDisk& VirtualDisk::operator=(VirtualDisk&& other) noexcept {
@@ -288,8 +385,12 @@ VirtualDisk& VirtualDisk::operator=(VirtualDisk&& other) noexcept {
 		m_imagePath = std::move(other.m_imagePath);
 		m_mountPath = std::move(other.m_mountPath);
 		m_options = std::move(other.m_options);
+		Wipe(m_recoveryKey);
+		m_recoveryKey = std::move(other.m_recoveryKey);
 		m_deleteImage = std::exchange(other.m_deleteImage, false);
+		m_locked = std::exchange(other.m_locked, false);
 		other.m_mountPath.clear();
+		Wipe(other.m_recoveryKey);
 	}
 	return *this;
 }
@@ -334,6 +435,14 @@ const fs::path& VirtualDisk::GetMountPath() const noexcept {
 	return m_mountPath;
 }
 
+const std::string& VirtualDisk::GetRecoveryKey() const noexcept {
+	return m_recoveryKey;
+}
+
+bool VirtualDisk::IsLocked() const noexcept {
+	return m_locked;
+}
+
 Result<void> VirtualDisk::Format(const VolumeSpec& volume) {
 	if (!m_attachment) {
 		return Error{ Errc::NotAttached, "Format" };
@@ -350,19 +459,14 @@ Result<void> VirtualDisk::Format(const VolumeSpec& volume) {
 	}
 	m_mountPath.clear();
 
-	if (Result<void> initialized = InitializeIfVirtual(*m_attachment, volume); !initialized) {
-		return initialized;
+	Wipe(m_recoveryKey);
+	Result<void> written = volume.fileSystem == FileSystem::None
+		? InitializeIfVirtual(*m_attachment, volume, false)
+		: WriteVolume(*m_attachment, volume, m_options.mountPath, true, m_mountPath, m_recoveryKey);
+	if (written) {
+		m_locked = false;
 	}
-	if (volume.fileSystem == FileSystem::None) {
-		return {};
-	}
-
-	Result<fs::path> mounted = m_attachment->Mount(m_options.mountPath);
-	if (!mounted) {
-		return mounted.GetError();
-	}
-	m_mountPath = *mounted;
-	return {};
+	return written;
 }
 
 Result<void> VirtualDisk::Detach() {

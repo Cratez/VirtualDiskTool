@@ -58,6 +58,7 @@ add_library(vdt::VirtualDisk ALIAS VirtualDiskLib)
 
 if(WIN32)
 	target_sources(VirtualDiskLib PRIVATE
+		src/windows/BitLocker.cpp
 		src/windows/DiskLayout.cpp
 		src/windows/VolumeFormat.cpp
 		src/windows/WindowsBackend.cpp)

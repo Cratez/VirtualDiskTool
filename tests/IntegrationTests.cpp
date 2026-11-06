@@ -8,19 +8,25 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "Cli.h"
 #include "FakeBackend.h"
 #include "vdt/VirtualDisk.h"
+#include "windows/BitLocker.h"
 #include "windows/DiskLayout.h"
 #include "windows/Win32.h"
 
@@ -512,6 +518,20 @@ TEST_F(IntegrationTest, AScopedAttachmentEndsWhenTheProcessDies) {
 	EXPECT_FALSE(IsAttached(Image()));
 }
 
+// Likewise. BitLocker refuses to answer without admin rights, which makes this the one failure
+// to reach it that any machine can produce. A volume nobody can read must not be called
+// unlocked just because BitLocker couldn't be asked.
+TEST(WithoutAdminRightsTest, AVolumeBitLockerWontDiscussIsNotCalledUnlocked) {
+	if (IsElevated()) {
+		return;
+	}
+
+	Result<bool> locked = win::IsVolumeLocked(L"\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\");
+
+	ASSERT_FALSE(locked);
+	EXPECT_EQ(locked.GetError().code, std::errc::permission_denied);
+}
+
 // Only means something unelevated. It can't skip when elevated, because the VM run treats any
 // skip other than ReFS as a failure.
 TEST(WithoutAdminRightsTest, AttachingReportsAPortablePermissionError) {
@@ -554,7 +574,7 @@ protected:
 	int Run(const std::vector<std::string>& args) {
 		out.str("");
 		err.str("");
-		return cli::Run(args, out, err, DefaultBackend());
+		return cli::Run(args, out, err, DefaultBackend(), [this](bool) { return password; });
 	}
 
 	std::string ImageArgument(const std::string& name = "disk.vhdx") const {
@@ -586,6 +606,7 @@ protected:
 
 	std::ostringstream out;
 	std::ostringstream err;
+	std::optional<std::string> password;
 };
 
 } // anonymous namespace
@@ -804,6 +825,443 @@ TEST_F(CliIntegrationTest, UnicodePathsWorkFromStartToFinish) {
 
 	ASSERT_EQ(Run({ "detach", Utf8(image) }), cli::kExitSuccess) << err.str();
 	EXPECT_FALSE(IsAttached(image));
+}
+
+// A disk number can pass to another image once the first is detached. An object still holding
+// the old number must not reach the new disk.
+TEST_F(IntegrationTest, FormatRefusesADiskThatWasDetachedElsewhere) {
+	AttachOptions persistent;
+	persistent.lifetime = Lifetime::Persistent;
+	Result<VirtualDisk> stale = VirtualDisk::Create(Image("stale.vhdx"), Spec(FileSystem::None), persistent);
+	ASSERT_TRUE(stale) << stale.GetError().Message();
+	Result<void> detached = DetachImage(Image("stale.vhdx"));
+	ASSERT_TRUE(detached) << detached.GetError().Message();
+
+	Result<VirtualDisk> other = VirtualDisk::Create(Image("other.vhdx"), Spec());
+	ASSERT_TRUE(other) << other.GetError().Message();
+	WriteTextFile(other->GetMountPath() / "kept.txt", "kept");
+
+	Result<void> formatted = stale->Format({});
+
+	ASSERT_FALSE(formatted);
+	EXPECT_EQ(formatted.GetError().code, Errc::NotVirtualDisk) << formatted.GetError().Message();
+	EXPECT_EQ(ReadTextFile(other->GetMountPath() / "kept.txt"), "kept");
+}
+
+// --- Encryption, against real BitLocker ---
+
+namespace {
+
+constexpr const char* kPassword = "Correct-Horse-Battery-Staple-1";
+constexpr const char* kMarker = "VDT-ENCRYPTION-PLAINTEXT-MARKER";
+
+// They don't all treat old data alike. On the test VM a quick reformat cleared it from all of
+// these but a dynamic VHD, so only that kind can show that encrypting is what hid it.
+constexpr std::pair<const char*, Allocation> kImageKinds[] = {
+	{ "dynamic.vhdx", Allocation::Dynamic },
+	{ "fixed.vhdx", Allocation::Fixed },
+	{ "dynamic.vhd", Allocation::Dynamic },
+	{ "fixed.vhd", Allocation::Fixed } };
+
+constexpr const char* kImageThatKeepsOldData = "dynamic.vhd";
+
+bool FileContains(const fs::path& path, const std::string& text) {
+	std::ifstream file(path, std::ios::binary);
+	std::string content(static_cast<size_t>(fs::file_size(path)), '\0');
+	file.read(content.data(), static_cast<std::streamsize>(content.size()));
+	return content.find(text) != std::string::npos;
+}
+
+// Fills a volume with the marker, so that old data reaches its very end. It is far too big for
+// NTFS to keep inside its file table, which a new file table could cover by accident.
+void FillWithMarker(const fs::path& mount) {
+	std::string pattern;
+	while (pattern.size() < MiB(1)) {
+		pattern += kMarker;
+	}
+
+	// Big writes for speed, then small ones to use up what the last big one couldn't.
+	std::ofstream file(mount / "filler.bin", std::ios::binary);
+	for (const size_t size : { pattern.size(), size_t(4096) }) {
+		while (file.write(pattern.data(), static_cast<std::streamsize>(size))) {
+		}
+		file.clear();
+	}
+}
+
+class EncryptionTest : public IntegrationTest {
+protected:
+	static DiskSpec EncryptedSpec() {
+		DiskSpec spec = Spec();
+		spec.size = MiB(256);
+		spec.volume.password = kPassword;
+		return spec;
+	}
+
+	static AttachOptions WithPassword(const char* password) {
+		AttachOptions options;
+		options.password = password;
+		return options;
+	}
+
+	// Leaves an encrypted image with the marker in it, detached. Returns its recovery key.
+	std::string CreateEncryptedImage(const fs::path& image) {
+		Result<VirtualDisk> disk = VirtualDisk::Create(image, EncryptedSpec());
+		if (!disk) {
+			ADD_FAILURE() << disk.GetError().Message();
+			return {};
+		}
+		WriteTextFile(disk->GetMountPath() / "secret.txt", kMarker);
+		const std::string key = disk->GetRecoveryKey();
+		Result<void> detached = disk->Detach();
+		EXPECT_TRUE(detached) << detached.GetError().Message();
+		return key;
+	}
+
+	// Leaves a plain image detached, with old data everywhere. An MBR partition runs to the end
+	// of the disk and a GPT one stops short of it, so reformatting this as GPT, the default,
+	// leaves some of that data outside the new volume.
+	void CreateFullImage(const fs::path& image, Allocation allocation) {
+		DiskSpec spec = Spec();
+		spec.size = MiB(256);
+		spec.allocation = allocation;
+		spec.volume.partitionStyle = PartitionStyle::Mbr;
+
+		Result<VirtualDisk> disk = VirtualDisk::Create(image, spec);
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+		FillWithMarker(disk->GetMountPath());
+		Result<void> detached = disk->Detach();
+		ASSERT_TRUE(detached) << detached.GetError().Message();
+	}
+
+	// Leaves a plain fixed VHD detached, with old data between the partition table and the
+	// partition. No layout this library writes puts anything there, but another tool's can.
+	void CreateImageWithDataBeforeThePartition(const fs::path& image) {
+		DiskSpec spec = Spec();
+		spec.size = MiB(256);
+		spec.allocation = Allocation::Fixed;
+		{
+			Result<VirtualDisk> created = VirtualDisk::Create(image, spec);
+			ASSERT_TRUE(created) << created.GetError().Message();
+		}
+
+		std::fstream file(image, std::ios::binary | std::ios::in | std::ios::out);
+		file.seekp(static_cast<std::streamoff>(MiB(1) / 2));
+		file << kMarker;
+		ASSERT_TRUE(file.good());
+		file.close();
+		ASSERT_TRUE(FileContains(image, kMarker));
+	}
+
+	// Goes to the backend directly, to reformat with less protection than VirtualDisk ever uses.
+	void ReformatEncrypted(const fs::path& image, bool wholeVolume, bool eraseOutsideVolume) {
+		Result<std::unique_ptr<IAttachment>> attachment = DefaultBackend().Attach(image, {});
+		ASSERT_TRUE(attachment) << attachment.GetError().Message();
+		IAttachment& disk = **attachment;
+
+		Result<bool> isVirtual = disk.IsFileBackedVirtualDisk();
+		ASSERT_TRUE(isVirtual && *isVirtual);
+		Result<void> initialized = disk.Initialize({}, eraseOutsideVolume);
+		ASSERT_TRUE(initialized) << initialized.GetError().Message();
+		Result<fs::path> mounted = disk.Mount(std::nullopt);
+		ASSERT_TRUE(mounted) << mounted.GetError().Message();
+		Result<std::string> key = disk.Encrypt(kPassword, wholeVolume);
+		ASSERT_TRUE(key) << key.GetError().Message();
+		Result<void> detached = disk.Detach();
+		ASSERT_TRUE(detached) << detached.GetError().Message();
+	}
+};
+
+} // anonymous namespace
+
+TEST_F(EncryptionTest, AnEncryptedImageHidesItsDataAndComesBackLocked) {
+	const std::string key = CreateEncryptedImage(Image());
+	ASSERT_FALSE(key.empty());
+
+	EXPECT_FALSE(FileContains(Image(), kMarker));
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image());
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::Locked) << disk.GetError().Message();
+	EXPECT_FALSE(IsAttached(Image()));
+}
+
+TEST_F(EncryptionTest, TheScanCanSeePlaintextInAnUnencryptedImage) {
+	{
+		Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec());
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+		WriteTextFile(disk->GetMountPath() / "secret.txt", kMarker);
+	}
+	EXPECT_TRUE(FileContains(Image(), kMarker));
+}
+
+TEST_F(EncryptionTest, TheRightPasswordUnlocksIt) {
+	CreateEncryptedImage(Image());
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword(kPassword));
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_FALSE(disk->IsLocked());
+	EXPECT_EQ(ReadTextFile(disk->GetMountPath() / "secret.txt"), kMarker);
+}
+
+TEST_F(EncryptionTest, AWrongPasswordIsRefused) {
+	CreateEncryptedImage(Image());
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword("Not-The-Password-At-All-1"));
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::WrongPassword) << disk.GetError().Message();
+	EXPECT_FALSE(IsAttached(Image()));
+}
+
+TEST_F(EncryptionTest, TheRecoveryKeyUnlocksIt) {
+	const std::string key = CreateEncryptedImage(Image());
+	AttachOptions options;
+	options.recoveryKey = key;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_EQ(ReadTextFile(disk->GetMountPath() / "secret.txt"), kMarker);
+}
+
+TEST_F(EncryptionTest, ALockedImageCanStillBeErased) {
+	CreateEncryptedImage(Image());
+	AttachOptions options;
+	options.allowLocked = true;
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options);
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_TRUE(disk->IsLocked());
+
+	Result<void> formatted = disk->Format({});
+
+	ASSERT_TRUE(formatted) << formatted.GetError().Message();
+	EXPECT_FALSE(disk->IsLocked());
+	EXPECT_EQ(GetVolumeDetails(disk->GetMountPath()).fileSystem, L"NTFS");
+	EXPECT_FALSE(PathExists(disk->GetMountPath() / "secret.txt"));
+}
+
+TEST_F(EncryptionTest, FormatCanEncryptAnExistingDisk) {
+	for (const auto& [name, allocation] : kImageKinds) {
+		SCOPED_TRACE(name);
+		const fs::path image = Image(name);
+		ASSERT_NO_FATAL_FAILURE(CreateFullImage(image, allocation));
+		Result<VirtualDisk> disk = VirtualDisk::Open(image);
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+
+		Result<void> formatted = disk->Format({ .password = kPassword });
+
+		ASSERT_TRUE(formatted) << formatted.GetError().Message();
+		EXPECT_FALSE(disk->GetRecoveryKey().empty());
+		ASSERT_TRUE(disk->Detach());
+
+		// The tests below show that each step is needed for this to hold.
+		EXPECT_FALSE(FileContains(image, kMarker));
+
+		Result<VirtualDisk> reopened = VirtualDisk::Open(image);
+		ASSERT_FALSE(reopened);
+		EXPECT_EQ(reopened.GetError().code, Errc::Locked);
+	}
+}
+
+TEST_F(EncryptionTest, ReformattingErasesTheStartOfTheDisk) {
+	const fs::path image = Image("fixed.vhd");
+	ASSERT_NO_FATAL_FAILURE(CreateImageWithDataBeforeThePartition(image));
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(image);
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	Result<void> formatted = disk->Format({ .password = kPassword });
+	ASSERT_TRUE(formatted) << formatted.GetError().Message();
+	ASSERT_TRUE(disk->Detach());
+
+	EXPECT_FALSE(FileContains(image, kMarker));
+}
+
+// An unformatted volume is as unreadable as a locked one, so only BitLocker can tell them apart.
+TEST_F(EncryptionTest, AnUnformattedVolumeIsNotTakenForALockedOne) {
+	{
+		Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(FileSystem::None));
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+
+		Result<std::vector<AttachedImage>> attached = ListAttached();
+		ASSERT_TRUE(attached) << attached.GetError().Message();
+		const auto entry = std::find_if(attached->begin(), attached->end(),
+			[&](const AttachedImage& candidate) { return SamePath(candidate.image, Image()); });
+		ASSERT_TRUE(entry != attached->end());
+
+		Result<void> written = win::WriteSinglePartition(entry->device.native(), {}, false);
+		ASSERT_TRUE(written) << written.GetError().Message();
+	}
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image());
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_FALSE(disk->IsLocked());
+}
+
+// The layout stays the same, so anything left is inside the new volume. What happens is printed
+// for every kind of image, but only one kind has to keep it.
+TEST_F(EncryptionTest, AReformatAloneLeavesOldDataInTheImage) {
+	for (const auto& [name, allocation] : kImageKinds) {
+		SCOPED_TRACE(name);
+		const fs::path image = Image(name);
+		ASSERT_NO_FATAL_FAILURE(CreateFullImage(image, allocation));
+		Result<VirtualDisk> disk = VirtualDisk::Open(image);
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+
+		Result<void> formatted = disk->Format({ .partitionStyle = PartitionStyle::Mbr });
+
+		ASSERT_TRUE(formatted) << formatted.GetError().Message();
+		ASSERT_TRUE(disk->Detach());
+
+		const bool visible = FileContains(image, kMarker);
+		std::cout << "After a quick reformat, old data in " << name << " is " << (visible ? "visible" : "gone") << '\n';
+		if (std::string_view(name) == kImageThatKeepsOldData) {
+			EXPECT_TRUE(visible);
+		}
+	}
+}
+
+TEST_F(EncryptionTest, EncryptingOnlyDataInUseLeavesOldDataInTheImage) {
+	const fs::path image = Image(kImageThatKeepsOldData);
+	ASSERT_NO_FATAL_FAILURE(CreateFullImage(image, Allocation::Dynamic));
+	ASSERT_NO_FATAL_FAILURE(ReformatEncrypted(image, false, true));
+	EXPECT_TRUE(FileContains(image, kMarker));
+}
+
+TEST_F(EncryptionTest, EncryptingOnlyTheVolumeLeavesOldDataAfterIt) {
+	const fs::path image = Image("fixed.vhd");
+	ASSERT_NO_FATAL_FAILURE(CreateFullImage(image, Allocation::Fixed));
+	ASSERT_NO_FATAL_FAILURE(ReformatEncrypted(image, true, false));
+	EXPECT_TRUE(FileContains(image, kMarker));
+}
+
+TEST_F(EncryptionTest, EncryptingOnlyTheVolumeLeavesOldDataBeforeIt) {
+	const fs::path image = Image("fixed.vhd");
+	ASSERT_NO_FATAL_FAILURE(CreateImageWithDataBeforeThePartition(image));
+	ASSERT_NO_FATAL_FAILURE(ReformatEncrypted(image, true, false));
+	EXPECT_TRUE(FileContains(image, kMarker));
+}
+
+TEST_F(EncryptionTest, AVhdWorksToo) {
+	CreateEncryptedImage(Image("disk.vhd"));
+	EXPECT_FALSE(FileContains(Image("disk.vhd"), kMarker));
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image("disk.vhd"), WithPassword(kPassword));
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_EQ(ReadTextFile(disk->GetMountPath() / "secret.txt"), kMarker);
+}
+
+TEST_F(EncryptionTest, ATemporaryEncryptedDiskCleansUp) {
+	fs::path image;
+	{
+		Result<VirtualDisk> disk = VirtualDisk::CreateTemporary(EncryptedSpec());
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+		image = disk->GetImagePath();
+	}
+	EXPECT_FALSE(PathExists(image));
+}
+
+TEST_F(EncryptionTest, ADiskThatIsTooSmallIsRefusedCleanly) {
+	DiskSpec spec = EncryptedSpec();
+	spec.size = MiB(64);
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), spec);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::TooSmallToEncrypt) << disk.GetError().Message();
+	EXPECT_FALSE(PathExists(Image()));
+}
+
+TEST_F(EncryptionTest, AnUnacceptablePasswordIsRefusedCleanly) {
+	DiskSpec spec = EncryptedSpec();
+	spec.volume.password = "abc";
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), spec);
+
+	ASSERT_FALSE(disk);
+	std::cout << "A short password gives: " << disk.GetError().Message() << '\n';
+	EXPECT_FALSE(PathExists(Image()));
+	EXPECT_FALSE(IsAttached(Image()));
+}
+
+TEST_F(EncryptionTest, APasswordForAnUnencryptedImageIsRefused) {
+	{
+		Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec());
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+	}
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword(kPassword));
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::InvalidArgument) << disk.GetError().Message();
+	EXPECT_FALSE(IsAttached(Image()));
+}
+
+// Records how much a dynamic image grows, which only a real disk can show.
+TEST_F(EncryptionTest, DynamicImagesStaySmallerThanTheirDisks) {
+	for (const uint64_t size : { MiB(256), GiB(1), GiB(8) }) {
+		const fs::path image = Image(std::to_string(size) + ".vhdx");
+		DiskSpec spec = EncryptedSpec();
+		spec.size = size;
+
+		Result<VirtualDisk> disk = VirtualDisk::Create(image, spec);
+
+		ASSERT_TRUE(disk) << disk.GetError().Message();
+		ASSERT_TRUE(disk->Detach());
+		const uint64_t fileSize = fs::file_size(image);
+		std::cout << "An encrypted " << size / MiB(1) << " MiB disk uses " << fileSize / MiB(1) << " MiB\n";
+		EXPECT_LT(fileSize, size);
+	}
+}
+
+TEST_F(CliIntegrationTest, EncryptionWorksFromStartToFinish) {
+	const std::string keyFile = Utf8(Image("disk.key"));
+	password = kPassword;
+	ASSERT_EQ(Run({ "create", ImageArgument(), "--size", "256M", "--encrypt", "--recovery-key-file", keyFile, "--attach" }), cli::kExitSuccess) << err.str();
+	WriteTextFile(PrintedPath() / "secret.txt", kMarker);
+	ASSERT_EQ(Run({ "detach", ImageArgument() }), cli::kExitSuccess) << err.str();
+
+	EXPECT_FALSE(FileContains(Image(), kMarker));
+	EXPECT_EQ(fs::file_size(Image("disk.key")) > 48, true);
+
+	EXPECT_EQ(Run({ "attach", ImageArgument() }), cli::kExitFailure);
+	EXPECT_FALSE(IsAttached(Image()));
+
+	password = "Not-The-Password-At-All-1";
+	EXPECT_EQ(Run({ "attach", ImageArgument(), "--unlock" }), cli::kExitFailure);
+	EXPECT_FALSE(IsAttached(Image()));
+
+	password = kPassword;
+	ASSERT_EQ(Run({ "attach", ImageArgument(), "--unlock" }), cli::kExitSuccess) << err.str();
+	EXPECT_EQ(ReadTextFile(PrintedPath() / "secret.txt"), kMarker);
+	ASSERT_EQ(Run({ "detach", ImageArgument() }), cli::kExitSuccess) << err.str();
+
+	ASSERT_EQ(Run({ "attach", ImageArgument(), "--recovery-key-file", keyFile }), cli::kExitSuccess) << err.str();
+	EXPECT_EQ(ReadTextFile(PrintedPath() / "secret.txt"), kMarker);
+	ASSERT_EQ(Run({ "detach", ImageArgument() }), cli::kExitSuccess) << err.str();
+}
+
+TEST_F(CliIntegrationTest, FormatErasesAnEncryptedImageWithoutItsPassword) {
+	password = kPassword;
+	ASSERT_EQ(Run({ "create", ImageArgument(), "--size", "256M", "--encrypt", "--recovery-key-file", Utf8(Image("disk.key")) }), cli::kExitSuccess) << err.str();
+	password.reset();
+
+	ASSERT_EQ(Run({ "format", ImageArgument(), "--fs", "ntfs", "--yes" }), cli::kExitSuccess) << err.str();
+
+	ASSERT_EQ(Run({ "attach", ImageArgument() }), cli::kExitSuccess) << err.str();
+	ASSERT_EQ(Run({ "detach", ImageArgument() }), cli::kExitSuccess) << err.str();
+}
+
+TEST_F(CliIntegrationTest, AFailedEncryptedCreateLeavesNeitherFile) {
+	password = kPassword;
+
+	EXPECT_EQ(Run({ "create", ImageArgument(), "--size", "64M", "--encrypt", "--recovery-key-file", Utf8(Image("disk.key")) }), cli::kExitFailure);
+
+	EXPECT_FALSE(PathExists(Image()));
+	EXPECT_FALSE(PathExists(Image("disk.key")));
 }
 
 int RunCrashChild(const fs::path& image) {

@@ -22,6 +22,8 @@ constexpr DWORD kMaxGptPartitions = 128;
 constexpr DWORD kMbrPartitions = 4;
 constexpr int kMaxDisks = 64;
 constexpr size_t kDependencyBufferSize = 4096;
+constexpr size_t kLargestSectorSize = 4096;
+constexpr DWORD kEraseChunkSize = 64 * 1024;
 
 // PARTITION_BASIC_DATA_GUID from diskguid.h, which would need initguid.h here.
 constexpr GUID kBasicDataPartition = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
@@ -83,6 +85,29 @@ Result<UniqueHandle> OpenVirtualDiskForWriting(const std::wstring& physicalPath)
 	return std::move(disk);
 }
 
+Result<void> WriteZeros(HANDLE disk, LONGLONG start, LONGLONG end) {
+	LARGE_INTEGER position = {};
+	position.QuadPart = start;
+	if (!SetFilePointerEx(disk, position, nullptr, FILE_BEGIN)) {
+		return LastError("Seek on disk");
+	}
+
+	// A disk only takes whole sectors, from memory aligned to them.
+	alignas(kLargestSectorSize) const BYTE zeros[kEraseChunkSize] = {};
+	for (LONGLONG remaining = end - start; remaining > 0;) {
+		const DWORD chunk = static_cast<DWORD>(std::min<LONGLONG>(remaining, kEraseChunkSize));
+		DWORD written = 0;
+		if (!WriteFile(disk, zeros, chunk, &written, nullptr)) {
+			return LastError("Erase disk");
+		}
+		if (written != chunk) {
+			return Win32Error("Erase disk", ERROR_WRITE_FAULT);
+		}
+		remaining -= written;
+	}
+	return {};
+}
+
 Result<GUID> NewGuid() {
 	GUID guid = {};
 	const HRESULT result = CoCreateGuid(&guid);
@@ -107,6 +132,43 @@ constexpr DWORD LayoutSize(DWORD partitionCount) noexcept {
 Result<void> ReadLayout(HANDLE disk, std::vector<BYTE>& buffer) {
 	buffer.assign(LayoutSize(kMaxGptPartitions), 0);
 	return Ioctl(disk, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, "Read partition table", nullptr, 0, buffer.data(), static_cast<DWORD>(buffer.size()));
+}
+
+bool ContainsPartition(const DRIVE_LAYOUT_INFORMATION_EX& layout) {
+	if (layout.PartitionStyle == PARTITION_STYLE_GPT) {
+		return layout.PartitionCount > 0;
+	}
+	if (layout.PartitionStyle == PARTITION_STYLE_MBR) {
+		return std::any_of(layout.PartitionEntry, layout.PartitionEntry + layout.PartitionCount,
+			[](const PARTITION_INFORMATION_EX& entry) { return entry.Mbr.PartitionType != PARTITION_ENTRY_UNUSED; });
+	}
+	return false;
+}
+
+/// <summary>
+/// Zeroes the start and end of a disk, which is everything a new partition can leave out: the
+/// partition starts one alignment unit in, and with GPT it ends short of the backup table by
+/// up to another unit. Refuses a disk that still has a partition, because those sectors would
+/// still matter, and Windows would count them as part of a volume.
+/// </summary>
+Result<void> EraseDiskEdges(HANDLE disk, LONGLONG diskSize) {
+	if (Result<void> refreshed = Ioctl(disk, IOCTL_DISK_UPDATE_PROPERTIES, "Refresh disk", nullptr, 0, nullptr, 0); !refreshed) {
+		return refreshed;
+	}
+	std::vector<BYTE> buffer;
+	if (Result<void> read = ReadLayout(disk, buffer); !read) {
+		return read;
+	}
+	if (ContainsPartition(*reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(buffer.data()))) {
+		return Error{ std::make_error_code(std::errc::device_or_resource_busy), "Erase partition table" };
+	}
+
+	const LONGLONG head = std::min(kPartitionAlignment, diskSize);
+	const LONGLONG tail = std::max(head, diskSize - 2 * kPartitionAlignment);
+	if (Result<void> erased = WriteZeros(disk, 0, head); !erased) {
+		return erased;
+	}
+	return WriteZeros(disk, tail, diskSize);
 }
 
 } // anonymous namespace
@@ -156,15 +218,7 @@ Result<bool> HasPartition(const std::wstring& physicalPath) {
 	if (Result<void> read = ReadLayout(disk.Get(), buffer); !read) {
 		return read.GetError();
 	}
-	const auto* layout = reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(buffer.data());
-	if (layout->PartitionStyle == PARTITION_STYLE_GPT) {
-		return layout->PartitionCount > 0;
-	}
-	if (layout->PartitionStyle == PARTITION_STYLE_MBR) {
-		return std::any_of(layout->PartitionEntry, layout->PartitionEntry + layout->PartitionCount,
-			[](const PARTITION_INFORMATION_EX& entry) { return entry.Mbr.PartitionType != PARTITION_ENTRY_UNUSED; });
-	}
-	return false;
+	return ContainsPartition(*reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(buffer.data()));
 }
 
 Result<void> ClearLayout(const std::wstring& physicalPath) {
@@ -178,7 +232,7 @@ Result<void> ClearLayout(const std::wstring& physicalPath) {
 	return Ioctl(disk->Get(), IOCTL_DISK_UPDATE_PROPERTIES, "Refresh disk", nullptr, 0, nullptr, 0);
 }
 
-Result<void> WriteSinglePartition(const std::wstring& physicalPath, const VolumeSpec& volume) {
+Result<void> WriteSinglePartition(const std::wstring& physicalPath, const VolumeSpec& volume, bool eraseOutsideVolume) {
 	Result<UniqueHandle> disk = OpenVirtualDiskForWriting(physicalPath);
 	if (!disk) {
 		return disk.GetError();
@@ -195,8 +249,14 @@ Result<void> WriteSinglePartition(const std::wstring& physicalPath, const Volume
 	}
 
 	// Only matters when reformatting. A blank disk has no layout to delete, and if this fails
-	// on a real one then the next call will too, and report it.
+	// on a real one then what follows will refuse the disk, and report it.
 	(void)Ioctl(disk->Get(), IOCTL_DISK_DELETE_DRIVE_LAYOUT, "Erase partition table", nullptr, 0, nullptr, 0);
+
+	if (eraseOutsideVolume) {
+		if (Result<void> erased = EraseDiskEdges(disk->Get(), geometry.DiskSize.QuadPart); !erased) {
+			return erased;
+		}
+	}
 
 	const bool gpt = volume.partitionStyle == PartitionStyle::Gpt;
 	CREATE_DISK createDisk = {};

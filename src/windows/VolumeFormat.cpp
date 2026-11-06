@@ -14,6 +14,11 @@ namespace {
 // both rely on them, and the integration tests check them against the real DLL.
 constexpr DWORD kFixedMedia = 12;
 
+// Something can briefly hold a brand new volume open, which makes FormatEx report it as in use.
+// This has been seen after BitLocker's service started, but what holds it isn't known.
+constexpr int kFormatAttempts = 20;
+constexpr DWORD kFormatRetryDelayMs = 250;
+
 enum FormatCommand : DWORD {
 	kProgress = 0,
 	kIncompatibleFileSystem = 3,
@@ -45,7 +50,7 @@ struct FormatOutcome {
 };
 
 // FormatEx passes no context to its callback, and nothing documents which thread calls it.
-// Guarded by formatMutex, which FormatVolume holds for the whole call.
+// Guarded by formatMutex, which FormatOnce holds for the whole call.
 std::mutex formatMutex;
 FormatOutcome* s_outcome = nullptr;
 
@@ -102,20 +107,6 @@ const wchar_t* FileSystemName(FileSystem fileSystem) noexcept {
 	}
 }
 
-Result<std::wstring> Utf8ToWide(const std::string& text) {
-	if (text.empty()) {
-		return std::wstring();
-	}
-	const int size = static_cast<int>(text.size());
-	const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), size, nullptr, 0);
-	if (length == 0) {
-		return LastError("Convert volume label");
-	}
-	std::wstring wide(static_cast<size_t>(length), L'\0');
-	MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), size, wide.data(), length);
-	return wide;
-}
-
 Error FormatFailure(const FormatOutcome& outcome) {
 	if (outcome.problem == kIncompatibleFileSystem) {
 		return Error{ Errc::Unsupported, "FormatEx" };
@@ -135,7 +126,31 @@ Error FormatFailure(const FormatOutcome& outcome) {
 	return Win32Error(std::move(operation), ERROR_GEN_FAILURE);
 }
 
+Result<void> FormatOnce(FormatExFunction formatEx, std::wstring root, std::wstring fileSystem, std::wstring label, bool quick) {
+	const std::lock_guard<std::mutex> lock(formatMutex);
+	FormatOutcome outcome;
+	s_outcome = &outcome;
+	formatEx(root.data(), kFixedMedia, fileSystem.data(), label.data(), quick ? TRUE : FALSE, 0, OnFormatProgress);
+	s_outcome = nullptr;
+
+	if (!outcome.succeeded) {
+		return FormatFailure(outcome);
+	}
+	return {};
+}
+
 } // anonymous namespace
+
+Result<void> RetryWhileInUse(const std::function<Result<void>()>& attempt, int attempts, DWORD delayMs) {
+	const std::error_code inUse(ERROR_BUSY, std::system_category());
+	for (int tries = 1;; ++tries) {
+		Result<void> result = attempt();
+		if (result || result.GetError().code != inUse || tries >= attempts) {
+			return result;
+		}
+		Sleep(delayMs);
+	}
+}
 
 Result<void> FormatVolume(const std::wstring& volume, const VolumeSpec& spec) {
 	const wchar_t* name = FileSystemName(spec.fileSystem);
@@ -157,18 +172,11 @@ Result<void> FormatVolume(const std::wstring& volume, const VolumeSpec& spec) {
 	if (!root.empty() && root.back() == L'\\') {
 		root.pop_back();
 	}
-	std::wstring fileSystem(name);
 
-	const std::lock_guard<std::mutex> lock(formatMutex);
-	FormatOutcome outcome;
-	s_outcome = &outcome;
-	formatEx(root.data(), kFixedMedia, fileSystem.data(), label->data(), spec.quickFormat ? TRUE : FALSE, 0, OnFormatProgress);
-	s_outcome = nullptr;
-
-	if (!outcome.succeeded) {
-		return FormatFailure(outcome);
-	}
-	return {};
+	return RetryWhileInUse(
+		[&] { return FormatOnce(formatEx, root, name, *label, spec.quickFormat); },
+		kFormatAttempts,
+		kFormatRetryDelayMs);
 }
 
 } // namespace vdt::win

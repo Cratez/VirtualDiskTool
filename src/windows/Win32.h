@@ -62,4 +62,29 @@ inline Error LastError(const char* operation) {
 	return Win32Error(operation, code);
 }
 
+inline Result<std::wstring> Utf8ToWide(const std::string& text) {
+	if (text.empty()) {
+		return std::wstring();
+	}
+	const int size = static_cast<int>(text.size());
+	const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), size, nullptr, 0);
+	if (length == 0) {
+		return LastError("Convert text from UTF-8");
+	}
+	std::wstring wide(static_cast<size_t>(length), L'\0');
+	MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), size, wide.data(), length);
+	return wide;
+}
+
+inline std::string WideToUtf8(const std::wstring& text) {
+	if (text.empty()) {
+		return {};
+	}
+	const int size = static_cast<int>(text.size());
+	const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(), size, nullptr, 0, nullptr, nullptr);
+	std::string utf8(static_cast<size_t>(length), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, text.data(), size, utf8.data(), length, nullptr, nullptr);
+	return utf8;
+}
+
 } // namespace vdt::win

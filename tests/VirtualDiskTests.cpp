@@ -322,7 +322,7 @@ TEST_F(VirtualDiskTest, OpenAttachesAndMounts) {
 	WriteImageFile();
 	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), {}, backend);
 	ASSERT_TRUE(disk);
-	EXPECT_EQ(backend.calls, (Calls{ "ListAttached", "Attach", "Mount" }));
+	EXPECT_EQ(backend.calls, (Calls{ "ListAttached", "Attach", "Mount", "IsLocked" }));
 	EXPECT_EQ(disk->GetMountPath(), fs::path("FakeMount"));
 }
 
@@ -620,6 +620,287 @@ TEST_F(VirtualDiskTest, FormatRejectsAReadOnlyDisk) {
 	ASSERT_FALSE(formatted);
 	EXPECT_EQ(formatted.GetError().code, Errc::InvalidArgument);
 	EXPECT_TRUE(backend.calls.empty());
+}
+
+// --- Encryption ---
+
+namespace {
+
+class EncryptionUnitTest : public VirtualDiskTest {
+protected:
+	static DiskSpec EncryptedSpec() {
+		DiskSpec spec = Spec();
+		spec.volume.password = "password";
+		return spec;
+	}
+
+	static AttachOptions WithPassword(const char* password) {
+		AttachOptions options;
+		options.password = password;
+		return options;
+	}
+};
+
+} // anonymous namespace
+
+TEST_F(EncryptionUnitTest, CreateEncryptsStraightAfterMounting) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_EQ(backend.calls, (Calls{ "CreateImage", "Attach", "IsFileBackedVirtualDisk", "Initialize", "Mount", "IsFileBackedVirtualDisk", "Encrypt" }));
+	EXPECT_EQ(backend.lastEncryptionPassword, "password");
+	EXPECT_EQ(disk->GetRecoveryKey(), "recovery-key");
+	EXPECT_FALSE(disk->IsLocked());
+}
+
+TEST_F(EncryptionUnitTest, NoPasswordMeansNoEncryption) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), {}, backend);
+	ASSERT_TRUE(disk);
+	EXPECT_FALSE(Called("Encrypt"));
+	EXPECT_TRUE(disk->GetRecoveryKey().empty());
+}
+
+TEST_F(EncryptionUnitTest, EncryptingRechecksTheTarget) {
+	backend.virtualChecksBeforeRefusing = 1; // Yes for formatting, then no for encrypting.
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::NotVirtualDisk);
+	EXPECT_FALSE(Called("Encrypt"));
+}
+
+TEST_F(EncryptionUnitTest, AFailedEncryptionLeavesNothingBehind) {
+	backend.failures["Encrypt"] = Error{ Errc::TooSmallToEncrypt, "Encrypt" };
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::TooSmallToEncrypt);
+	EXPECT_FALSE(fs::exists(Image()));
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(EncryptionUnitTest, APasswordNeedsAFileSystem) {
+	DiskSpec spec = EncryptedSpec();
+	spec.volume.fileSystem = FileSystem::None;
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), spec, {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::InvalidArgument);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(EncryptionUnitTest, ABackendWithoutEncryptionFailsBeforeCreatingAnything) {
+	backend.supportsEncryption = false;
+
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::Unsupported);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(EncryptionUnitTest, OpeningALockedImageWithNoSecretFailsAndDetaches) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::Locked);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(EncryptionUnitTest, TheRightPasswordUnlocks) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword("password"), backend);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_FALSE(disk->IsLocked());
+	EXPECT_FALSE(backend.diskIsLocked);
+}
+
+TEST_F(EncryptionUnitTest, AWrongPasswordFailsAndDetaches) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword("wrong"), backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::WrongPassword);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(EncryptionUnitTest, TheRecoveryKeyUnlocks) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+	AttachOptions options;
+	options.recoveryKey = "recovery-key";
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options, backend);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_TRUE(Called("UnlockWithRecoveryKey"));
+}
+
+TEST_F(EncryptionUnitTest, GivingBothSecretsIsRefused) {
+	WriteImageFile();
+	AttachOptions options = WithPassword("password");
+	options.recoveryKey = "recovery-key";
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::InvalidArgument);
+	EXPECT_TRUE(backend.calls.empty());
+}
+
+TEST_F(EncryptionUnitTest, APasswordForAnUnencryptedImageIsRefused) {
+	WriteImageFile();
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), WithPassword("password"), backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::InvalidArgument);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(EncryptionUnitTest, AllowLockedLeavesItLockedButFormattable) {
+	WriteImageFile();
+	backend.diskIsLocked = true;
+	AttachOptions options;
+	options.allowLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options, backend);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_TRUE(disk->IsLocked());
+	ASSERT_TRUE(disk->Format({}));
+	EXPECT_FALSE(disk->IsLocked());
+}
+
+TEST_F(EncryptionUnitTest, FormatCanEncrypt) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), {}, backend);
+	ASSERT_TRUE(disk);
+
+	ASSERT_TRUE(disk->Format({ .password = "password" }));
+
+	EXPECT_EQ(backend.lastEncryptionPassword, "password");
+	EXPECT_EQ(disk->GetRecoveryKey(), "recovery-key");
+}
+
+TEST_F(EncryptionUnitTest, ANewImageOnlyEncryptsDataInUse) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+	ASSERT_TRUE(disk);
+	EXPECT_FALSE(backend.lastEncryptionWholeVolume);
+}
+
+// Reformatting doesn't erase old sectors, so anything less would leave old data readable.
+TEST_F(EncryptionUnitTest, ReformattingEncryptsTheWholeVolume) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), {}, backend);
+	ASSERT_TRUE(disk);
+
+	ASSERT_TRUE(disk->Format({ .password = "password" }));
+
+	EXPECT_TRUE(backend.lastEncryptionWholeVolume);
+}
+
+// Encrypting a volume can't reach what falls outside it, and that can still hold old data.
+TEST_F(EncryptionUnitTest, ReformattingErasesWhatTheVolumeWontCover) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), {}, backend);
+	ASSERT_TRUE(disk);
+
+	ASSERT_TRUE(disk->Format({ .password = "password" }));
+
+	EXPECT_TRUE(backend.lastEraseOutsideVolume);
+}
+
+// Without encryption old data stays readable anyway, and a new image has none.
+TEST_F(EncryptionUnitTest, OnlyEncryptingOverOldDataErasesOutsideTheVolume) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+	ASSERT_TRUE(disk);
+	EXPECT_FALSE(backend.lastEraseOutsideVolume);
+
+	ASSERT_TRUE(disk->Format({}));
+	EXPECT_FALSE(backend.lastEraseOutsideVolume);
+}
+
+// Ignoring these would leave a caller who meant to set a password with a plain disk.
+TEST_F(EncryptionUnitTest, ASecretForANewDiskInTheWrongPlaceIsRefused) {
+	AttachOptions recoveryKey;
+	recoveryKey.recoveryKey = "recovery-key";
+
+	for (const AttachOptions& options : { WithPassword("password"), recoveryKey }) {
+		Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), options, backend);
+
+		ASSERT_FALSE(disk);
+		EXPECT_EQ(disk.GetError().code, Errc::InvalidArgument);
+		EXPECT_TRUE(backend.calls.empty());
+	}
+}
+
+TEST_F(EncryptionUnitTest, NotKnowingWhetherItIsLockedFailsAndDetaches) {
+	WriteImageFile();
+	backend.failures["IsLocked"] = Error{ Errc::Timeout, "IsLocked" };
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), {}, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(disk.GetError().code, Errc::Timeout);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+// Erasing an image has to keep working on a system that can't say whether it is locked.
+TEST_F(EncryptionUnitTest, AllowLockedAssumesTheWorstIfItCannotTell) {
+	WriteImageFile();
+	backend.failures["IsLocked"] = Error{ Errc::Timeout, "IsLocked" };
+	AttachOptions options;
+	options.allowLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options, backend);
+
+	ASSERT_TRUE(disk) << disk.GetError().Message();
+	EXPECT_TRUE(disk->IsLocked());
+}
+
+// A secret means the caller needs the disk unlocked, which can't be promised here.
+TEST_F(EncryptionUnitTest, AllowLockedDoesNotHideThatFailureFromACallerWithASecret) {
+	WriteImageFile();
+	backend.failures["IsLocked"] = Error{ Errc::Timeout, "IsLocked" };
+	AttachOptions options = WithPassword("password");
+	options.allowLocked = true;
+
+	Result<VirtualDisk> disk = VirtualDisk::Open(Image(), options, backend);
+
+	ASSERT_FALSE(disk);
+	EXPECT_EQ(backend.attached, 0);
+}
+
+TEST_F(EncryptionUnitTest, AFailedEncryptionNeverLeavesTheVolumeMounted) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), Spec(), {}, backend);
+	ASSERT_TRUE(disk);
+	backend.failures["Encrypt"] = Error{ Errc::Timeout, "Encrypt" };
+
+	Result<void> formatted = disk->Format({ .password = "password" });
+
+	ASSERT_FALSE(formatted);
+	EXPECT_EQ(backend.calls.back(), "Unmount") << "The volume has to really be unmounted, not just forgotten.";
+	EXPECT_TRUE(disk->GetMountPath().empty());
+	EXPECT_TRUE(disk->GetRecoveryKey().empty());
+}
+
+TEST_F(EncryptionUnitTest, MovingKeepsTheRecoveryKeyAndLockState) {
+	Result<VirtualDisk> disk = VirtualDisk::Create(Image(), EncryptedSpec(), {}, backend);
+	ASSERT_TRUE(disk);
+
+	VirtualDisk moved = std::move(*disk);
+
+	EXPECT_EQ(moved.GetRecoveryKey(), "recovery-key");
+	EXPECT_TRUE(disk->GetRecoveryKey().empty());
 }
 
 // --- Documentation ---

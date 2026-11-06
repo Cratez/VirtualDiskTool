@@ -37,9 +37,10 @@ Result<void> ClearLayout(const std::wstring& physicalPath);
 /// <summary>
 /// Replaces the partition table with one that holds a single partition filling the disk.
 /// Fails with Errc::NotVirtualDisk unless the handle it writes through reports a
-/// file-backed virtual disk.
+/// file-backed virtual disk. eraseOutsideVolume also zeroes the parts of the disk the new
+/// partition won't cover.
 /// </summary>
-Result<void> WriteSinglePartition(const std::wstring& physicalPath, const VolumeSpec& volume);
+Result<void> WriteSinglePartition(const std::wstring& physicalPath, const VolumeSpec& volume, bool eraseOutsideVolume);
 
 /// <summary>
 /// The GUID path of a volume on the given disk, ending in a backslash. Skips the volume

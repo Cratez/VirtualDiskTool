@@ -1,7 +1,7 @@
 # VirtualDiskTool
 C++ Tool/Library for creating and managing virtual disks
 
-It creates VHD and VHDX images, then partitions, formats and mounts them, so you get a volume you can use straight away. The library cleans up after itself, and neither the library nor the tool can reach a real disk by mistake.
+It creates VHD and VHDX images, then partitions, formats and mounts them, so you get a volume you can use straight away. Images can be password protected with BitLocker. The library cleans up after itself, and neither the library nor the tool can reach a real disk by mistake.
 
 - **[Command line tool guide](docs/cli.md):** every command, plus how to use the tool from scripts.
 - **[Library guide](docs/library.md):** how to add the library to your project, and how to use it.
@@ -40,6 +40,8 @@ The code avoids anything known to break Windows 7, but Windows 7 is untested and
 On Windows 11, the suite has only run in Windows Sandbox, where a full (not quick) NTFS format fails. It isn't known yet whether that affects Windows 11 generally. Quick NTFS formats, and full exFAT and FAT32 formats, work there.
 
 ReFS is untested, because no test machine so far has been able to create it. `--fs refs` is still accepted, and it fails with an error where Windows refuses it.
+
+Password protection needs Windows Pro, Enterprise or Education, and has other limits. Its tests pass on real disks on Windows 10. See [Encryption](docs/cli.md#encryption).
 
 ## Building
 

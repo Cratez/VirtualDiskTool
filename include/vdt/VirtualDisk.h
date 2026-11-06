@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "vdt/Backend.h"
@@ -46,6 +47,11 @@ public:
 	/// Attaches an existing image and mounts its volume, if it has one. Fails with
 	/// Errc::AlreadyAttached if the image is attached already, so that a disk someone has
 	/// mounted can't be reached and erased through a second object.
+	///
+	/// An encrypted image needs options.password or options.recoveryKey, or it fails with
+	/// Errc::Locked unless options.allowLocked is set. Giving either for an image that isn't
+	/// encrypted fails with Errc::InvalidArgument, rather than leaving the caller believing
+	/// it is protected.
 	/// </summary>
 	static Result<VirtualDisk> Open(
 		const std::filesystem::path& image,
@@ -71,10 +77,23 @@ public:
 	const std::filesystem::path& GetMountPath() const noexcept;
 
 	/// <summary>
-	/// Destroys the disk's contents, writes one fresh volume and mounts it again.
-	/// Fails with Errc::NotVirtualDisk, changing nothing, unless the OS confirms the target
-	/// is a file-backed virtual disk. There is deliberately no way to format by drive letter
-	/// or device path.
+	/// The recovery key made when this object encrypted the disk, and empty otherwise. It
+	/// unlocks the disk if the password is lost, and can't be retrieved again later through
+	/// this library, so save it somewhere other than next to the image.
+	/// </summary>
+	const std::string& GetRecoveryKey() const noexcept;
+
+	/// <summary>
+	/// True if the disk is encrypted and locked, which needs AttachOptions::allowLocked.
+	/// </summary>
+	bool IsLocked() const noexcept;
+
+	/// <summary>
+	/// Destroys the disk's contents, writes one fresh volume and mounts it again, encrypting
+	/// it if volume.password is set. This works on a locked disk, because erasing needs no
+	/// password. Fails with Errc::NotVirtualDisk, changing nothing, unless the OS confirms the
+	/// target is a file-backed virtual disk. There is deliberately no way to format by drive
+	/// letter or device path.
 	/// </summary>
 	Result<void> Format(const VolumeSpec& volume);
 
@@ -97,7 +116,9 @@ private:
 		std::filesystem::path image,
 		std::filesystem::path mountPath,
 		const AttachOptions& options,
-		bool deleteImage);
+		bool deleteImage,
+		std::string recoveryKey,
+		bool locked);
 
 	static Result<VirtualDisk> CreateAt(
 		const std::filesystem::path& image,
@@ -113,8 +134,10 @@ private:
 	std::unique_ptr<IAttachment> m_attachment;
 	std::filesystem::path m_imagePath;
 	std::filesystem::path m_mountPath;
-	AttachOptions m_options;
+	AttachOptions m_options; // Holds no secrets: the constructor clears them.
+	std::string m_recoveryKey;
 	bool m_deleteImage = false;
+	bool m_locked = false;
 };
 
 /// <summary>
