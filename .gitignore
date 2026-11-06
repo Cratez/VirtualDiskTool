@@ -1,0 +1,8 @@
+# CMake
+/build/
+/out/
+CMakeUserPresets.json
+
+# Visual Studio
+.vs/
+*.user

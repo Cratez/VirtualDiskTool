@@ -1,0 +1,11 @@
+{
+  "name": "virtualdisktool",
+  "version": "0.1.0",
+  "builtin-baseline": "99aeb3ff0978ab22d0e5c6b199faacb06bd5e25b",
+  "features": {
+    "tests": {
+      "description": "GoogleTest, for the test suite",
+      "dependencies": [ "gtest" ]
+    }
+  }
+}
