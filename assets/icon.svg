@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
+	<title>VirtualDiskTool</title>
+	<path d="M16 6C10 6 9 10 9 16V25C9 29 7 32 3 32C7 32 9 35 9 39V48C9 54 10 58 16 58" fill="none" stroke="#1D9E75" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+	<path d="M48 6C54 6 55 10 55 16V25C55 29 57 32 61 32C57 32 55 35 55 39V48C55 54 54 58 48 58" fill="none" stroke="#1D9E75" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+	<circle cx="32" cy="32" r="14" fill="#5DCAA5"/>
+	<circle cx="32" cy="32" r="4.5" fill="#04342C"/>
+</svg>

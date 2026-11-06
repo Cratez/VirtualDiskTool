@@ -1,3 +1,5 @@
+<img src="assets/icon.svg" alt="VirtualDiskTool icon: a disk inside curly braces" width="96">
+
 # VirtualDiskTool
 C++ Tool/Library for creating and managing virtual disks
 

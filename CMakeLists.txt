@@ -77,7 +77,8 @@ endif()
 
 if(VDT_BUILD_TOOL)
 	add_executable(VirtualDiskTool
-		tools/main.cpp)
+		tools/main.cpp
+		tools/VirtualDiskTool.rc)
 	target_link_libraries(VirtualDiskTool PRIVATE VirtualDiskCli)
 endif()
 
